@@ -56,12 +56,4 @@ jobs:
 | `SEO_DOMAIN` | `piano-sheets.org` | 不含 https:// 的域名 |
 | `GA4_PROPERTY_ID` | `412345678` | GA4 纯数字 Property ID |
 
-## 现有接入项目
 
-| 项目 | 域名 | 运行时间 (UTC) |
-|---|---|---|
-| pianosheets | piano-sheets.org | 周五 02:16 |
-| MorseCodeGenerator | morsecodeGenerator.net | 周五 02:19 |
-| mp3transcript | mp3transcript.com | 周五 02:13 |
-| Percy-Jackson | percy-jackson.wiki | 周五 02:22 |
-| enhanceimage-tanstack | enhanceimage.org | 周五 02:25 |
