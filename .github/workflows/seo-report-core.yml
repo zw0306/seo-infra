@@ -219,7 +219,8 @@ jobs:
           echo "✅ Telegram HTML 附件已发送"
 
           # 13. 生成 Markdown 周报（语义聚类分析）
-          pip install sentence-transformers scikit-learn --quiet 2>/dev/null || true
+          python3 -m pip install --upgrade pip || true
+          python3 -m pip install sentence-transformers scikit-learn || echo "⚠️ 聚类依赖包安装失败"
           REPORT_NAME_MD="SEO-Weekly-Markdown-$DOMAIN-$(date +%Y%m%d).md"
           python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/generate_weekly_markdown.py" \
             --gsc-this "$TMP_DIR/gsc.json" \
