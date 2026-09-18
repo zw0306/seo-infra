@@ -64,3 +64,4 @@ jobs:
 | MorseCodeGenerator | morsecodeGenerator.net | 周五 02:19 |
 | mp3transcript | mp3transcript.com | 周五 02:13 |
 | Percy-Jackson | percy-jackson.wiki | 周五 02:22 |
+| enhanceimage-tanstack | (由项目设置) | 周五 02:25 |
