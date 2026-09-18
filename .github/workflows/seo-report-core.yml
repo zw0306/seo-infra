@@ -220,6 +220,8 @@ jobs:
 
           # 13. 生成 Markdown 周报（语义聚类分析）
           python3 -m pip install --upgrade pip || true
+          # 明确安装 CPU 版的 torch，避免下载 3GB 的 CUDA 库导致 "No space left on device"
+          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu || true
           python3 -m pip install sentence-transformers scikit-learn || echo "⚠️ 聚类依赖包安装失败"
           REPORT_NAME_MD="SEO-Weekly-Markdown-$DOMAIN-$(date +%Y%m%d).md"
           python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/generate_weekly_markdown.py" \
