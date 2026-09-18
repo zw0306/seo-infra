@@ -242,15 +242,32 @@ jobs:
           cp "$TMP_DIR/snapshot-this.json" "$PREV_SNAPSHOT"
           echo "✅ 快照已更新: $PREV_SNAPSHOT"
 
-      - name: Commit Snapshot Back to Repo
+          # 16. 按日期归档原始数据和报表
+          DATE_STR=$(date +%Y-%m-%d)
+          ARCHIVE_DIR="$WORKSPACE/reports/archive/$DATE_STR"
+          mkdir -p "$ARCHIVE_DIR"
+          
+          cp "$TMP_DIR/gsc.json" "$ARCHIVE_DIR/gsc.json" || true
+          cp "$TMP_DIR/ga4.json" "$ARCHIVE_DIR/ga4.json" || true
+          cp "$TMP_DIR/psi.json" "$ARCHIVE_DIR/pagespeed.json" || true
+          cp "$TMP_DIR/inspection.json" "$ARCHIVE_DIR/inspection.json" || true
+          
+          if [ -f "$REPORT_DIR/$REPORT_NAME_MD" ]; then
+              cp "$REPORT_DIR/$REPORT_NAME_MD" "$ARCHIVE_DIR/SEO-Weekly-Report.md"
+          fi
+          
+          echo "✅ 原始数据与报表已归档至: $ARCHIVE_DIR"
+
+      - name: Commit Data & Snapshot Back to Repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add reports/snapshots/gsc-snapshot-prev.json
+          git add reports/archive/
           if git diff --staged --quiet; then
-            echo "No snapshot changes to commit"
+            echo "No changes to commit"
           else
-            git commit -m "chore: update weekly GSC snapshot [skip ci]"
+            git commit -m "chore: archive weekly SEO raw data and snapshot [skip ci]"
             git push
           fi
 
