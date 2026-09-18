@@ -1,0 +1,261 @@
+name: "SEO Report Core (Reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      seo_domain:
+        description: "站点域名，例如 piano-sheets.org（不含 https://）"
+        required: true
+        type: string
+      ga4_property_id:
+        description: "GA4 纯数字 Property ID，例如 412345678"
+        required: true
+        type: string
+    secrets:
+      GOOGLE_API_KEY:
+        required: true
+      GOOGLE_SERVICE_ACCOUNT_JSON:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: true
+      TELEGRAM_TARGET_CHAT:
+        required: true
+
+jobs:
+  generate-seo-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 允许 Actions bot 将快照 commit 回仓库
+    steps:
+      - name: Checkout Caller Repository
+        uses: actions/checkout@v4
+
+      - name: Checkout seo-infra Scripts
+        uses: actions/checkout@v4
+        with:
+          repository: zw0306/seo-infra
+          ref: main
+          path: .seo-infra
+          # 私有仓库需要 token；使用调用方仓库自动生成的 token 即可
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Sentence Transformer Model
+        # 首次运行时下载 ~470MB 模型，之后每次命中缓存（key 固定不含日期）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/sentence_transformers
+          key: st-model-paraphrase-multilingual-MiniLM-L12-v2-v1
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl libpango-1.0-0 libpangoft2-1.0-0 libjpeg-dev libopenjp2-7-dev libffi-dev
+
+      - name: Get claude-seo latest commit
+        id: claude-seo-commit
+        run: echo "commit=$(git ls-remote https://github.com/AgriciDaniel/claude-seo.git HEAD | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Cache claude-seo Tool
+        uses: actions/cache@v4
+        with:
+          path: ~/.agents/.claude-seo-upstream
+          key: claude-seo-env-${{ runner.os }}-${{ steps.claude-seo-commit.outputs.commit }}
+          restore-keys: |
+            claude-seo-env-${{ runner.os }}-
+
+      - name: Install claude-seo Tool
+        run: |
+          mkdir -p ~/.agents
+
+          # 判断缓存是否命中
+          if [ ! -d "$HOME/.agents/.claude-seo-upstream/.git" ]; then
+            git clone https://github.com/AgriciDaniel/claude-seo.git ~/.agents/.claude-seo-upstream
+          else
+            echo "命中缓存，更新仓库..."
+            cd ~/.agents/.claude-seo-upstream
+            git pull origin main || true
+            cd -
+          fi
+
+          # 热修复：防止 Lighthouse 标题里的 <html> 或反引号注入导致报告内容消失
+          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/patch_report_escaping.py"
+
+          # 创建全局执行命令
+          mkdir -p ~/.local/bin
+          echo '#!/usr/bin/env bash' > ~/.local/bin/claude-seo
+          echo 'export CLAUDE_SEO_PYTHON="python"' >> ~/.local/bin/claude-seo
+          echo 'exec "$HOME/.agents/.claude-seo-upstream/scripts/claude-seo" "$@"' >> ~/.local/bin/claude-seo
+          chmod +x ~/.local/bin/claude-seo
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          echo "Running claude-seo setup..."
+          claude-seo setup
+
+      - name: Configure Google API Environment
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SEO_DOMAIN: ${{ inputs.seo_domain }}
+          GA4_PROPERTY_ID: ${{ inputs.ga4_property_id }}
+        run: |
+          mkdir -p ~/.config/claude-seo
+
+          # 1. 写入服务账号密钥文件
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > ~/.config/claude-seo/service-account.json
+
+          # 2. 生成配置文件
+          cat <<EOF > ~/.config/claude-seo/google-api.json
+          {
+            "service_account_path": "$HOME/.config/claude-seo/service-account.json",
+            "api_key": "$GOOGLE_API_KEY",
+            "default_property": "sc-domain:$SEO_DOMAIN",
+            "ga4_property_id": "properties/$GA4_PROPERTY_ID"
+          }
+          EOF
+
+      - name: Run SEO Full Report & Push to Telegram
+        env:
+          DOMAIN: ${{ inputs.seo_domain }}
+          PROPERTY: "sc-domain:${{ inputs.seo_domain }}"
+          GA4_PROPERTY: "properties/${{ inputs.ga4_property_id }}"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+        run: |
+          WORKSPACE=$GITHUB_WORKSPACE
+          REPORT_DIR="$WORKSPACE/reports/seo-weekly"
+          TMP_DIR="$WORKSPACE/reports/tmp"
+          SNAPSHOT_DIR="$WORKSPACE/reports/snapshots"
+          mkdir -p "$REPORT_DIR" "$TMP_DIR" "$SNAPSHOT_DIR"
+
+          echo "开始拉取 SEO 数据..."
+
+          # 1. GSC 7天数据
+          if ! claude-seo run gsc_query.py query -p "$PROPERTY" --days 7 --json > "$TMP_DIR/gsc.json"; then
+              echo "❌ GSC 拉取失败"; cat "$TMP_DIR/gsc.json"; exit 1
+          fi
+
+          # 2. GA4 7天数据
+          if ! claude-seo run ga4_report.py --property "$GA4_PROPERTY" --days 7 --json > "$TMP_DIR/ga4.json"; then
+              echo "❌ GA4 拉取失败"; cat "$TMP_DIR/ga4.json"; exit 1
+          fi
+
+          # 3. PageSpeed 数据
+          if ! claude-seo run pagespeed_check.py "https://$DOMAIN/" --json > "$TMP_DIR/psi.json"; then
+              echo "❌ PageSpeed 拉取失败"; cat "$TMP_DIR/psi.json"; exit 1
+          fi
+
+          # 4. 网页收录状态
+          echo "https://$DOMAIN/" > "$TMP_DIR/urls_to_inspect.txt"
+          if ! claude-seo run gsc_inspect.py -s "$PROPERTY" --batch "$TMP_DIR/urls_to_inspect.txt" --json > "$TMP_DIR/inspection.json"; then
+              echo "❌ GSC Inspect 拉取失败"; cat "$TMP_DIR/inspection.json"; exit 1
+          fi
+
+          # 5. 上周 GSC 数据（用于 Markdown 周报环比）
+          DATA_END=$(date -d "3 days ago" +%Y-%m-%d)
+          THIS_WEEK_START=$(date -d "$DATA_END - 6 days" +%Y-%m-%d)
+          LAST_WEEK_END=$(date -d "$THIS_WEEK_START - 1 day" +%Y-%m-%d)
+          LAST_WEEK_START=$(date -d "$LAST_WEEK_END - 6 days" +%Y-%m-%d)
+          echo "📅 本周: $THIS_WEEK_START → $DATA_END  上周: $LAST_WEEK_START → $LAST_WEEK_END"
+
+          claude-seo run gsc_query.py query -p "$PROPERTY" \
+            --start-date "$LAST_WEEK_START" --end-date "$LAST_WEEK_END" \
+            --json > "$TMP_DIR/gsc_last.json" || echo "{}" > "$TMP_DIR/gsc_last.json"
+          echo "✅ 上周 GSC 数据已拉取"
+
+          # 6. GA4 最近 14 天 daily_data
+          claude-seo run ga4_report.py --property "$GA4_PROPERTY" --days 14 \
+            --json > "$TMP_DIR/ga4_14d.json" || echo "{}" > "$TMP_DIR/ga4_14d.json"
+          echo "✅ GA4 14天数据已拉取"
+
+          # 7. 提取辅助变量
+          PSI_SCORE=$(jq '.categories.performance.score // 0 | (. * 100) | floor' "$TMP_DIR/psi.json" 2>/dev/null || echo "0")
+          INDEXED_COUNT=$(jq '.indexed_count // 1' "$TMP_DIR/inspection.json" 2>/dev/null || echo "1")
+          WEEK_NUM=$(date +%V)
+
+          # 8. 加载上周快照（如存在）
+          PREV_SNAPSHOT="$SNAPSHOT_DIR/gsc-snapshot-prev.json"
+
+          # 9. 生成 Telegram 极简摘要
+          SUMMARY_ARGS="--gsc $TMP_DIR/gsc.json --ga4 $TMP_DIR/ga4.json --domain $DOMAIN --week $WEEK_NUM --psi $PSI_SCORE --indexed $INDEXED_COUNT --out $TMP_DIR/telegram.txt --snapshot $TMP_DIR/snapshot-this.json"
+          if [ -f "$PREV_SNAPSHOT" ]; then
+              SUMMARY_ARGS="$SUMMARY_ARGS --prev $PREV_SNAPSHOT"
+          fi
+          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/seo_weekly_summary.py" $SUMMARY_ARGS
+
+          # 10. 合并数据生成 HTML 报告
+          echo "合并底层数据..."
+          jq -s '.[0] as $gsc | .[1] as $ga4 | .[2] as $psi | .[3] as $inspection | {gsc: $gsc, ga4: $ga4, psi: $psi, inspection: $inspection}' \
+              "$TMP_DIR/gsc.json" "$TMP_DIR/ga4.json" "$TMP_DIR/psi.json" "$TMP_DIR/inspection.json" > "$TMP_DIR/full_data.json"
+
+          REPORT_NAME_HTML="Google-SEO-Weekly-$DOMAIN-$(date +%Y%m%d).html"
+          echo "正在生成 HTML 报告..."
+          claude-seo run google_report.py --type full --data "$TMP_DIR/full_data.json" --domain "$DOMAIN" --output-dir "$REPORT_DIR" --format html
+
+          if [ ! -f "$REPORT_DIR/Google-SEO-Report-$DOMAIN-full.html" ]; then
+              echo "❌ HTML 报告生成失败！"; exit 1
+          fi
+          mv "$REPORT_DIR/Google-SEO-Report-$DOMAIN-full.html" "$REPORT_DIR/$REPORT_NAME_HTML"
+          echo "✅ HTML 报告: $REPORT_DIR/$REPORT_NAME_HTML"
+
+          # 11. 发送 Telegram 文字摘要
+          TELEGRAM_TEXT=$(cat "$TMP_DIR/telegram.txt")
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_TARGET_CHAT}" \
+              -d parse_mode="Markdown" \
+              --data-urlencode "text=${TELEGRAM_TEXT}" > /dev/null
+          echo "✅ Telegram 文字摘要已发送"
+
+          # 12. 发送 HTML 附件
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F chat_id="${TELEGRAM_TARGET_CHAT}" \
+              -F document=@"$REPORT_DIR/$REPORT_NAME_HTML" \
+              -F caption="📎 完整 SEO 报告 · $DOMAIN · $(date +%Y-%m-%d)" > /dev/null
+          echo "✅ Telegram HTML 附件已发送"
+
+          # 13. 生成 Markdown 周报（语义聚类分析）
+          pip install sentence-transformers scikit-learn --quiet 2>/dev/null || true
+          REPORT_NAME_MD="SEO-Weekly-Markdown-$DOMAIN-$(date +%Y%m%d).md"
+          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/generate_weekly_markdown.py" \
+            --gsc-this "$TMP_DIR/gsc.json" \
+            --gsc-last "$TMP_DIR/gsc_last.json" \
+            --ga4-14d  "$TMP_DIR/ga4_14d.json" \
+            --domain   "$DOMAIN" \
+            --out      "$REPORT_DIR/$REPORT_NAME_MD" || echo "⚠️ Markdown 周报生成失败，不阻断主流程"
+
+          # 14. 发送 Markdown 周报到 Telegram
+          if [ -f "$REPORT_DIR/$REPORT_NAME_MD" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F chat_id="${TELEGRAM_TARGET_CHAT}" \
+              -F document=@"$REPORT_DIR/$REPORT_NAME_MD" \
+              -F caption="📋 SEO 深度周报（语义聚类版）· $DOMAIN · $(date +%Y-%m-%d)" > /dev/null
+            echo "✅ Telegram Markdown 周报已发送"
+          fi
+
+          # 15. 更新快照（本周 → 成为下周的上周）
+          cp "$TMP_DIR/snapshot-this.json" "$PREV_SNAPSHOT"
+          echo "✅ 快照已更新: $PREV_SNAPSHOT"
+
+      - name: Commit Snapshot Back to Repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/snapshots/gsc-snapshot-prev.json
+          if git diff --staged --quiet; then
+            echo "No snapshot changes to commit"
+          else
+            git commit -m "chore: update weekly GSC snapshot [skip ci]"
+            git push
+          fi
+
+      - name: Upload Report Artifact (Optional Backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: seo-weekly-report
+          path: reports/seo-weekly/*
+          retention-days: 7
