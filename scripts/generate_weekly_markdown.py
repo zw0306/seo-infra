@@ -7,6 +7,7 @@ SEO 周报生成器（工作流版）
   --gsc-this  : 本周 GSC JSON（query+page 双维度 + totals）
   --gsc-last  : 上周 GSC JSON（格式相同）
   --ga4-14d   : GA4 最近 14 天 daily_data（--days 14 拉取，脚本内按日期分割本周/上周）
+  --trends    : trend_scout.py 输出的 JSON（可选，生成趋势信号 Section）
   --domain    : 站点域名
   --out       : 输出 Markdown 文件路径
 
@@ -315,20 +316,93 @@ def generate_report(args) -> str:
                             "diff": -d["clicks"], "position": 0})
     losers.sort(key=lambda x: x["diff"])
 
-    # CTR 快速优化机会
-    quick_wins = [
-        {"query": r["query"], "position": round(r["position"], 1),
-         "impressions": r["impressions"], "clicks": r["clicks"], "ctr": r["ctr"]}
-        for r in this_kw_map.values()
-        if 4 <= r["position"] <= 20 and r["impressions"] >= 50 and r["ctr"] < 0.05
-    ]
+    # CTR 快速优化机会（排名 4-20，高曝光低 CTR）
+    quick_wins = []
+    for r in this_kw_map.values():
+        if 4 <= r["position"] <= 20 and r["impressions"] >= 50 and r["ctr"] < 0.05:
+            prev = last_kw_map.get(r["query"])
+            prev_pos = prev["position"] if prev else None
+            pos = r["position"]
+            if prev_pos:
+                diff = prev_pos - pos
+                if diff > 0:
+                    pos_str = f"{pos:.1f} (↑ {diff:.1f})"
+                elif diff < 0:
+                    pos_str = f"{pos:.1f} (↓ {-diff:.1f})"
+                else:
+                    pos_str = f"{pos:.1f} (-)"
+            else:
+                pos_str = f"{pos:.1f} (新)"
+            
+            quick_wins.append({
+                "query": r["query"], 
+                "position": round(pos, 1),
+                "pos_str": pos_str,
+                "impressions": r["impressions"], 
+                "clicks": r["clicks"], 
+                "ctr": r["ctr"],
+                "page": r.get("page", "")
+            })
     quick_wins.sort(key=lambda x: x["impressions"], reverse=True)
+
+    # CTR 异常词：排名 1-3 但 CTR 低于该位置期望均值
+    # 期望 CTR 参考：P1≈0.28, P2≈0.15, P3≈0.11
+    EXPECTED_CTR = {1: 0.28, 2: 0.15, 3: 0.11}
+    ctr_anomalies = []
+    for r in this_kw_map.values():
+        pos = r["position"]
+        imp = r["impressions"]
+        ctr = r["ctr"]
+        if pos < 1 or imp < 30:
+            continue
+        pos_floor = max(1, min(3, int(pos)))
+        expected = EXPECTED_CTR.get(pos_floor)
+        if expected and ctr < expected * 0.6 and imp >= 30:
+            # impact_score = 潜在可增量点击数
+            impact = round(imp * (expected - ctr), 1)
+            
+            prev = last_kw_map.get(r["query"])
+            prev_pos = prev["position"] if prev else None
+            if prev_pos:
+                diff = prev_pos - pos
+                if diff > 0:
+                    pos_str = f"{pos:.1f} (↑ {diff:.1f})"
+                elif diff < 0:
+                    pos_str = f"{pos:.1f} (↓ {-diff:.1f})"
+                else:
+                    pos_str = f"{pos:.1f} (-)"
+            else:
+                pos_str = f"{pos:.1f} (新)"
+
+            ctr_anomalies.append({
+                "query": r["query"],
+                "position": round(pos, 1),
+                "pos_str": pos_str,
+                "impressions": imp,
+                "ctr": ctr,
+                "expected_ctr": expected,
+                "impact_score": impact,
+                "page": r.get("page", "")
+            })
+    ctr_anomalies.sort(key=lambda x: x["impact_score"], reverse=True)
 
     # 新增流量页面
     new_pages = sorted(
         [d for url, d in this_page_map.items() if url not in last_page_map and d["clicks"] >= 2],
         key=lambda x: x["clicks"], reverse=True
     )
+
+    # 趋势数据（可选）
+    trends_angles: list = []
+    trends_raw: dict = {}
+    if getattr(args, "trends", None) and args.trends:
+        try:
+            trends_json = load_json(args.trends)
+            trends_angles = trends_json.get("angles", [])
+            trends_raw = trends_json.get("trends", {})
+            print(f"  🔥 已加载趋势数据: {len(trends_angles)} 个内容机会")
+        except Exception as e:
+            print(f"  ⚠️  趋势数据加载失败: {e}")
 
     # 语义聚类（仅对 query 行）
     clusters, semantic_ok = analyze_topic_clusters(list(this_kw_map.values()))
@@ -381,12 +455,29 @@ def generate_report(args) -> str:
     lines.append("")
 
     lines += ["## 4. 🎯 快速优化机会（排名 4-20，高曝光低 CTR）", "",
-              "| 关键词 | 排名 | 曝光 | 点击 | CTR | 建议 |",
+              "| 关键词 (带链接) | 排名 (变化) | 曝光 | 点击 | CTR | 建议 |",
               "|---|---|---|---|---|---|"]
     for q in quick_wins[:20]:
         sug = "优化 Title + Meta" if q["position"] <= 10 else "提升内容质量冲首页"
-        lines.append(f"| {q['query']} | {q['position']} | {q['impressions']} | {q['clicks']} | {fmt_ctr(q['ctr'])} | {sug} |")
+        kw_display = f"[{q['query']}]({q['page']})" if q.get("page") else q['query']
+        lines.append(f"| {kw_display} | {q['pos_str']} | {q['impressions']} | {q['clicks']} | {fmt_ctr(q['ctr'])} | {sug} |")
     lines.append("")
+
+    # Section 4b：CTR 异常词（排名好但没人点）
+    if ctr_anomalies:
+        lines += ["## 4b. 🚨 CTR 异常词（排名靠前但点击率偏低）", "",
+                  "> 这些词的排名已进入前 3，但 CTR 远低于同位置均值，优化 Title/描述可大幅提升点击量。",
+                  "",
+                  "| 关键词 (带链接) | 排名 (变化) | 曝光 | 实际 CTR | 期望 CTR | 潜在增量点击 | 建议 |",
+                  "|---|---|---|---|---|---|---|"]
+        for a in ctr_anomalies[:15]:
+            kw_display = f"[{a['query']}]({a['page']})" if a.get("page") else a['query']
+            lines.append(
+                f"| {kw_display} | {a['pos_str']} | {a['impressions']} "
+                f"| {fmt_ctr(a['ctr'])} | {fmt_ctr(a['expected_ctr'])} "
+                f"| +{a['impact_score']:.0f} 次/周 | 重写 Title/Meta Description |"
+            )
+        lines.append("")
 
     page_list = sorted(this_page_map.values(), key=lambda x: x["clicks"], reverse=True)[:15]
     lines += ["## 5. 📄 Top 15 页面", "",
@@ -430,9 +521,18 @@ def generate_report(args) -> str:
 
     lines += ["## 8. ✅ 本周 Action Items", ""]
     actions = []
+    if ctr_anomalies:
+        ca = ctr_anomalies[0]
+        ca_display = f"[{ca['query']}]({ca['page']})" if ca.get("page") else f"「{ca['query']}」"
+        actions.append(
+            f"- [ ] **🚨 优先修复 CTR 异常**: {ca_display} 排名 {ca['position']}，"
+            f"实际 CTR {fmt_ctr(ca['ctr'])} vs 期望 {fmt_ctr(ca['expected_ctr'])}，"
+            f"潜在增量 +{ca['impact_score']:.0f} 点击/周 → 重写 Title + Meta"
+        )
     if quick_wins:
         qw = quick_wins[0]
-        actions.append(f"- [ ] **优化 Title/Meta**: 「{qw['query']}」排名 {qw['position']}，曝光 {qw['impressions']} 但 CTR 仅 {fmt_ctr(qw['ctr'])}")
+        qw_display = f"[{qw['query']}]({qw['page']})" if qw.get("page") else f"「{qw['query']}」"
+        actions.append(f"- [ ] **优化 Title/Meta**: {qw_display} 排名 {qw['position']}，曝光 {qw['impressions']} 但 CTR 仅 {fmt_ctr(qw['ctr'])}")
     if losers:
         lo = losers[0]
         actions.append(f"- [ ] **检查排名下降**: 「{lo['query']}」点击从 {lo['prev_clicks']} 降至 {lo['clicks']}")
@@ -444,6 +544,27 @@ def generate_report(args) -> str:
     lines.extend(actions)
     lines.append("")
 
+    # Section 9：趋势信号（来自 trend_scout.py）
+    if trends_angles:
+        lines += ["## 9. 🔥 本周趋势信号（内容方向建议）", "",
+                  "> 数据来源：Google Trends / Hacker News / Reddit",
+                  "",
+                  "| 主题 | 来源 | 相关度 | 建议动作 |",
+                  "|---|---|---|---|"]
+        for a in trends_angles[:8]:
+            topic_short = a["topic"][:60] + ("…" if len(a["topic"]) > 60 else "")
+            score_label = "🔴 高" if a["relevance_score"] >= 50 else "🟡 中" if a["relevance_score"] >= 25 else "🟢 低"
+            angle = a.get("angle", "-")[:40]
+            lines.append(f"| {topic_short} | {a['source']} | {score_label} | {angle} |")
+
+        gt = trends_raw.get("google_trends", [])
+        if gt:
+            lines.append("")
+            lines.append("**📡 Google 热搜榜 Top 8（US）：**")
+            for t in gt[:8]:
+                lines.append(f"- {t['topic']} ({t.get('traffic', 'N/A')})")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -452,6 +573,7 @@ def main():
     parser.add_argument("--gsc-this", required=True, help="本周 GSC JSON 路径")
     parser.add_argument("--gsc-last", required=True, help="上周 GSC JSON 路径")
     parser.add_argument("--ga4-14d",  default=None,  help="GA4 最近 14 天 JSON 路径（可选）")
+    parser.add_argument("--trends",   default=None,  help="trend_scout.py 输出的 JSON 路径（可选）")
     parser.add_argument("--domain",   required=True, help="站点域名")
     parser.add_argument("--out",      required=True, help="输出 Markdown 文件路径")
     args = parser.parse_args()

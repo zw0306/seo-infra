@@ -11,6 +11,11 @@ on:
         description: "GA4 纯数字 Property ID，例如 412345678"
         required: true
         type: string
+      seo_niche_keywords:
+        description: "趋势监控关键词，逗号分隔（可选，不配置则从 domain 推断）。例： piano sheet music,free piano sheets"
+        required: false
+        type: string
+        default: ""
     secrets:
       GOOGLE_API_KEY:
         required: true
@@ -124,6 +129,7 @@ jobs:
           DOMAIN: ${{ inputs.seo_domain }}
           PROPERTY: "sc-domain:${{ inputs.seo_domain }}"
           GA4_PROPERTY: "properties/${{ inputs.ga4_property_id }}"
+          SEO_NICHE_KEYWORDS: ${{ inputs.seo_niche_keywords }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
         run: |
@@ -231,6 +237,29 @@ jobs:
             --domain   "$DOMAIN" \
             --out      "$REPORT_DIR/$REPORT_NAME_MD" || echo "⚠️ Markdown 周报生成失败，不阻断主流程"
 
+          # 13b. 运行 Trend Scout（免费数据源：Google Trends/HN/Reddit）
+          echo "🔥 运行 Trend Scout..."
+          TREND_KEYWORDS="$SEO_NICHE_KEYWORDS"
+          TREND_ARGS="--niche $DOMAIN --out $TMP_DIR/trends.json --telegram $TMP_DIR/trends.txt"
+          if [ -n "$TREND_KEYWORDS" ]; then
+            TREND_ARGS="$TREND_ARGS --keywords \"$TREND_KEYWORDS\""
+          fi
+          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/trend_scout.py" $TREND_ARGS \
+            || echo "⚠️ Trend Scout 失败，跳过（不阻断主流程）"
+
+          # 13c. 将趋势数据并入 Markdown 周报
+          if [ -f "$TMP_DIR/trends.json" ]; then
+            REPORT_NAME_MD_FULL="SEO-Weekly-Full-$DOMAIN-$(date +%Y%m%d).md"
+            python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/generate_weekly_markdown.py" \
+              --gsc-this "$TMP_DIR/gsc.json" \
+              --gsc-last "$TMP_DIR/gsc_last.json" \
+              --ga4-14d  "$TMP_DIR/ga4_14d.json" \
+              --trends   "$TMP_DIR/trends.json" \
+              --domain   "$DOMAIN" \
+              --out      "$REPORT_DIR/$REPORT_NAME_MD" || echo "⚠️ 全量 Markdown 周报生成失败"
+            echo "✅ 已将趋势数据并入 Markdown 周报"
+          fi
+
           # 14. 发送 Markdown 周报到 Telegram
           if [ -f "$REPORT_DIR/$REPORT_NAME_MD" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
@@ -238,6 +267,16 @@ jobs:
               -F document=@"$REPORT_DIR/$REPORT_NAME_MD" \
               -F caption="📋 SEO 深度周报（语义聚类版）· $DOMAIN · $(date +%Y-%m-%d)" > /dev/null
             echo "✅ Telegram Markdown 周报已发送"
+          fi
+
+          # 14b. 发送趋势简报到 Telegram
+          if [ -f "$TMP_DIR/trends.txt" ]; then
+            TRENDS_TEXT=$(cat "$TMP_DIR/trends.txt")
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_TARGET_CHAT}" \
+              -d parse_mode="Markdown" \
+              --data-urlencode "text=${TRENDS_TEXT}" > /dev/null
+            echo "✅ Telegram 趋势简报已发送"
           fi
 
           # 15. 更新快照（本周 → 成为下周的上周）
@@ -253,6 +292,7 @@ jobs:
           cp "$TMP_DIR/ga4.json" "$ARCHIVE_DIR/ga4.json" || true
           cp "$TMP_DIR/psi.json" "$ARCHIVE_DIR/pagespeed.json" || true
           cp "$TMP_DIR/inspection.json" "$ARCHIVE_DIR/inspection.json" || true
+          cp "$TMP_DIR/trends.json" "$ARCHIVE_DIR/trends.json" || true
           
           if [ -f "$REPORT_DIR/$REPORT_NAME_MD" ]; then
               cp "$REPORT_DIR/$REPORT_NAME_MD" "$ARCHIVE_DIR/SEO-Weekly-Report.md"

@@ -9,7 +9,8 @@ SEO 报表基础设施仓库，集中管理所有项目通用的 SEO 周报自�
   seo-report-core.yml    # 可复用工作流（Reusable Workflow）核心逻辑
 scripts/
   seo_weekly_summary.py      # Telegram 极简摘要生成
-  generate_weekly_markdown.py # 语义聚类深度周报生成
+  generate_weekly_markdown.py # 语义聚类深度周报生成（支持 CTR 异常词分析 + 趋势 Section）
+  trend_scout.py             # 多源趋势监控（Google Trends/HN/Reddit，全免费）
   patch_report_escaping.py   # claude-seo 热修复补丁
 ```
 
@@ -31,6 +32,7 @@ jobs:
     with:
       seo_domain: ${{ vars.SEO_DOMAIN }}
       ga4_property_id: ${{ vars.GA4_PROPERTY_ID }}
+      seo_niche_keywords: ${{ vars.SEO_NICHE_KEYWORDS }}  # 可选，不配置则自动从 domain 推断
     secrets:
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -55,5 +57,6 @@ jobs:
 |---|---|---|
 | `SEO_DOMAIN` | `piano-sheets.org` | 不含 https:// 的域名 |
 | `GA4_PROPERTY_ID` | `412345678` | GA4 纯数字 Property ID |
+| `SEO_NICHE_KEYWORDS` | `piano sheet music,free piano sheets,sheet music pdf` | 趋势监控关键词，逗号分隔。**可选**，不配置则自动从 `SEO_DOMAIN` 推断 |
 
 
