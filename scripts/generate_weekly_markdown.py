@@ -91,6 +91,40 @@ def parse_gsc_totals(gsc_data: dict) -> dict:
     }
 
 
+def aggregate_by_key(rows: list, key_field: str, value_field: str) -> dict:
+    """按 key_field 聚合数据，避免多维度时数据相互覆盖。同时记录曝光最高的 value_field。"""
+    agg = {}
+    for r in rows:
+        k = r.get(key_field)
+        if not k:
+            continue
+        if k not in agg:
+            agg[k] = {
+                key_field: k,
+                value_field: r.get(value_field, ""),
+                "clicks": 0,
+                "impressions": 0,
+                "sum_pos_x_imp": 0.0,
+                "top_imp": -1
+            }
+        item = agg[k]
+        imp = r["impressions"]
+        item["clicks"] += r["clicks"]
+        item["impressions"] += imp
+        item["sum_pos_x_imp"] += r["position"] * imp
+        if imp > item["top_imp"]:
+            item["top_imp"] = imp
+            item[value_field] = r.get(value_field, "")
+            
+    # 计算加权平均 position 和总 ctr
+    for item in agg.values():
+        imp = item["impressions"]
+        item["ctr"] = item["clicks"] / imp if imp > 0 else 0
+        item["position"] = item["sum_pos_x_imp"] / imp if imp > 0 else 0
+        
+    return agg
+
+
 # ──────────────────────────────────────────────
 # GA4 数据解析（从 14 天 daily_data 按日期分割）
 # ──────────────────────────────────────────────
@@ -283,10 +317,10 @@ def generate_report(args) -> str:
     this_total = parse_gsc_totals(gsc_this)
     last_total = parse_gsc_totals(gsc_last)
 
-    this_kw_map   = {r["query"]: r for r in this_rows if r["query"]}
-    last_kw_map   = {r["query"]: r for r in last_rows if r["query"]}
-    this_page_map = {r["page"]: r  for r in this_rows if r["page"]}
-    last_page_map = {r["page"]: r  for r in last_rows if r["page"]}
+    this_kw_map   = aggregate_by_key(this_rows, "query", "page")
+    last_kw_map   = aggregate_by_key(last_rows, "query", "page")
+    this_page_map = aggregate_by_key(this_rows, "page", "query")
+    last_page_map = aggregate_by_key(last_rows, "page", "query")
 
     # GA4 汇总
     ga4_this_t, ga4_last_t = {}, {}
@@ -297,9 +331,11 @@ def generate_report(args) -> str:
     gainers = []
     for kw, d in this_kw_map.items():
         prev = last_kw_map.get(kw)
-        if prev and d["clicks"] > prev["clicks"]:
-            gainers.append({"query": kw, "clicks": d["clicks"], "prev_clicks": prev["clicks"],
-                             "diff": d["clicks"] - prev["clicks"],
+        prev_clicks = prev["clicks"] if prev else 0
+        diff = d["clicks"] - prev_clicks
+        if diff > 0:
+            gainers.append({"query": kw, "clicks": d["clicks"], "prev_clicks": prev_clicks,
+                             "diff": diff,
                              "position": round(d["position"], 1), "impressions": d["impressions"]})
     gainers.sort(key=lambda x: x["diff"], reverse=True)
 
@@ -307,13 +343,12 @@ def generate_report(args) -> str:
     losers = []
     for kw, d in last_kw_map.items():
         curr = this_kw_map.get(kw)
-        if curr and d["clicks"] > curr["clicks"]:
-            losers.append({"query": kw, "clicks": curr["clicks"], "prev_clicks": d["clicks"],
-                            "diff": curr["clicks"] - d["clicks"],
-                            "position": round(curr["position"], 1)})
-        elif not curr and d["clicks"] >= 3:
-            losers.append({"query": kw, "clicks": 0, "prev_clicks": d["clicks"],
-                            "diff": -d["clicks"], "position": 0})
+        curr_clicks = curr["clicks"] if curr else 0
+        diff = curr_clicks - d["clicks"]
+        if diff < 0:
+            pos = round(curr["position"], 1) if curr else 0
+            losers.append({"query": kw, "clicks": curr_clicks, "prev_clicks": d["clicks"],
+                            "diff": diff, "position": pos})
     losers.sort(key=lambda x: x["diff"])
 
     # CTR 快速优化机会（排名 4-20，高曝光低 CTR）

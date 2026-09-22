@@ -132,18 +132,34 @@ def find_quick_wins(gsc: dict, min_impressions: int = 30) -> list:
     if built_in:
         return built_in
 
-    wins = []
+    # 如果内置的不存在，从 rows 中自行聚合计算，避免多维度碎片化数据覆盖
+    query_agg = {}
     for r in gsc.get("rows", []):
-        pos = r.get("position", 0)
-        impressions = r.get("impressions", 0)
-        ctr = r.get("ctr", 0)
-        query = r.get("query", "")
-        if 4 <= pos <= 20 and impressions >= min_impressions and ctr < 0.05:
+        q = r.get("query")
+        if not q: 
+            continue
+        if q not in query_agg:
+            query_agg[q] = {"query": q, "clicks": 0, "impressions": 0, "sum_pos_x_imp": 0.0}
+        item = query_agg[q]
+        imp = r.get("impressions", 0)
+        item["clicks"] += r.get("clicks", 0)
+        item["impressions"] += imp
+        item["sum_pos_x_imp"] += r.get("position", 0) * imp
+
+    wins = []
+    for item in query_agg.values():
+        imp = item["impressions"]
+        if imp < min_impressions:
+            continue
+        pos = item["sum_pos_x_imp"] / imp if imp > 0 else 0
+        ctr = item["clicks"] / imp if imp > 0 else 0
+        
+        if 4 <= pos <= 20 and ctr < 0.05:
             wins.append({
-                "query": query,
+                "query": item["query"],
                 "position": round(pos, 1),
-                "impressions": impressions,
-                "clicks": r.get("clicks", 0),
+                "impressions": imp,
+                "clicks": item["clicks"],
                 "ctr": ctr,
             })
     wins.sort(key=lambda x: x["impressions"], reverse=True)
@@ -159,10 +175,13 @@ def find_page_drift(curr_rows: list, prev_rows: list, top_n: int = 10) -> tuple[
     def to_map(rows):
         m = {}
         for r in rows:
-            # claude-seo gsc rows 直接有 page 字段
             key = r.get("page") or r.get("query", "")
-            if key:
-                m[key] = r
+            if not key:
+                continue
+            if key not in m:
+                m[key] = {"clicks": 0, "impressions": 0}
+            m[key]["clicks"] += r.get("clicks", 0)
+            m[key]["impressions"] += r.get("impressions", 0)
         return m
 
     curr_map = to_map(curr_rows)
