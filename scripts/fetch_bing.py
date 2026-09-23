@@ -201,7 +201,7 @@ def fetch_crawl_issues(site_url: str, api_key: str) -> list[dict]:
 def fetch_bing_data(domain: str, days: int, out_dir: Path):
     """拉取 Bing Webmaster 数据并保存为 JSON 到 out_dir"""
     api_key = get_bing_api_key()
-    site_url = os.environ.get("BING_SITE_URL", f"https://{domain}/")
+    site_url = os.environ.get("BING_SITE_URL") or f"https://{domain}/"
 
     end_date = datetime.now().date() - timedelta(days=2)
     date_str = end_date.strftime("%Y-%m-%d")
