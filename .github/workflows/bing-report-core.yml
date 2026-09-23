@@ -1,0 +1,128 @@
+name: "Bing SEO Report Core (Reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      seo_domain:
+        description: "站点域名，例如 piano-sheets.org（不含 https://）"
+        required: true
+        type: string
+      bing_site_url:
+        description: "Bing 站点 URL（如 https://example.com/，留空则自动从 seo_domain 推断）"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      BING_API_KEY:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: true
+      TELEGRAM_TARGET_CHAT:
+        required: true
+
+jobs:
+  generate-bing-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Caller Repository
+        uses: actions/checkout@v4
+
+      - name: Checkout seo-infra Scripts
+        uses: actions/checkout@v4
+        with:
+          repository: zw0306/seo-infra
+          ref: main
+          path: .seo-infra
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests
+
+      - name: Fetch Bing Data & Generate Report
+        env:
+          DOMAIN: ${{ inputs.seo_domain }}
+          BING_API_KEY: ${{ secrets.BING_API_KEY }}
+          BING_SITE_URL: ${{ inputs.bing_site_url }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+        run: |
+          WORKSPACE=$GITHUB_WORKSPACE
+          REPORT_DIR="$WORKSPACE/reports/bing-monthly"
+          TMP_DIR="$WORKSPACE/reports/tmp/bing"
+          mkdir -p "$REPORT_DIR" "$TMP_DIR"
+
+          DATE_STR=$(date +%Y-%m-%d)
+          REPORT_NAME="Bing-SEO-Monthly-${DOMAIN}-${DATE_STR}.md"
+
+          # 1. 拉取 Bing 数据
+          echo "🔍 拉取 Bing Webmaster 数据..."
+          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/fetch_bing.py" \
+            --domain "$DOMAIN" \
+            --days 30 \
+            --out-dir "$TMP_DIR" \
+            || { echo "❌ Bing 数据拉取失败"; exit 1; }
+
+          # 2. 查找本期已存在的 GSC JSON（优先用本周周报归档，用于双引擎对比）
+          GSC_JSON=""
+          LATEST_GSC=$(find "$WORKSPACE/reports/archive" -name "gsc.json" | sort | tail -1)
+          if [ -n "$LATEST_GSC" ]; then
+            GSC_JSON="$LATEST_GSC"
+            echo "✅ 找到 GSC 数据: $GSC_JSON"
+          else
+            echo "⚠️ 未找到 GSC 归档数据，跳过双引擎对比"
+          fi
+
+          # 3. 生成 Bing Markdown 月报
+          echo "📊 生成 Bing 月报..."
+          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/report_bing.py" \
+            --domain "$DOMAIN" \
+            --bing-dir "$TMP_DIR" \
+            --gsc-json "$GSC_JSON" \
+            --out "$REPORT_DIR/$REPORT_NAME" \
+            || { echo "❌ Bing 月报生成失败"; exit 1; }
+
+          echo "✅ Bing 月报已生成: $REPORT_DIR/$REPORT_NAME"
+
+          # 4. 发送 Bing 月报到 Telegram
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F chat_id="${TELEGRAM_TARGET_CHAT}" \
+            -F document=@"$REPORT_DIR/$REPORT_NAME" \
+            -F caption="📊 Bing SEO 月报 · ${DOMAIN} · ${DATE_STR}" \
+            > /dev/null \
+            && echo "✅ Telegram Bing 月报已发送" \
+            || echo "⚠️ Telegram 发送失败（不阻断主流程）"
+
+          # 5. 归档 Bing 原始数据
+          ARCHIVE_DIR="$WORKSPACE/reports/archive/bing/${DATE_STR}"
+          mkdir -p "$ARCHIVE_DIR"
+          cp "$TMP_DIR/"*.json "$ARCHIVE_DIR/" 2>/dev/null || true
+          cp "$REPORT_DIR/$REPORT_NAME" "$ARCHIVE_DIR/" 2>/dev/null || true
+          echo "✅ Bing 数据已归档至: $ARCHIVE_DIR"
+
+      - name: Commit Bing Archive Back to Repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/bing-monthly/ reports/archive/bing/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: archive monthly Bing SEO report [skip ci]"
+            git push
+          fi
+
+      - name: Upload Bing Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bing-monthly-report
+          path: reports/bing-monthly/*
+          retention-days: 30
