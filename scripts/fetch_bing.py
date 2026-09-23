@@ -60,66 +60,32 @@ def bing_get(endpoint: str, params: dict, api_key: str, retries: int = 3) -> dic
 def fetch_query_stats(site_url: str, api_key: str, days: int) -> list[dict]:
     """
     拉取关键词查询统计 (GetQueryStats)
-    Bing API 按月返回，需按月迭代请求后合并同一关键词跨月数据。
+    注意：Bing API 的 GetQueryStats 接口只接受 siteUrl 参数，并默认返回近 30 天的统计。
+    （原先传 startDate 循环拉取的做法会导致 API 忽略参数并重复返回 30 天数据，从而使总量翻倍）。
     返回: [{ query, clicks, impressions, ctr, avg_position }, ...]
     """
-    raw = []
-    end_date = datetime.now().date() - timedelta(days=2)
-    start_date = end_date - timedelta(days=days)
+    data = bing_get("GetQueryStats", {"siteUrl": site_url}, api_key)
+    results = []
+    
+    if data and "d" in data:
+        rows = data["d"]
+        if isinstance(rows, list):
+            for row in rows:
+                query = row.get("Query", "")
+                if not query:
+                    continue
+                clicks = row.get("Clicks", 0)
+                impressions = row.get("Impressions", 0)
+                results.append({
+                    "query": query,
+                    "clicks": clicks,
+                    "impressions": impressions,
+                    "ctr": round(clicks / impressions, 4) if impressions > 0 else 0,
+                    "avg_position": round(row.get("AvgClickPosition", 0), 1),
+                })
 
-    current = start_date.replace(day=1)
-    while current <= end_date:
-        month_str = current.strftime("%Y-%m-%d")
-        data = bing_get("GetQueryStats", {
-            "siteUrl": site_url,
-            "startDate": month_str,
-            "additionalMonth": 0,
-        }, api_key)
-
-        if data and "d" in data:
-            rows = data["d"]
-            if isinstance(rows, list):
-                for row in rows:
-                    query = row.get("Query", "")
-                    if not query:
-                        continue
-                    raw.append({
-                        "query": query,
-                        "clicks": row.get("Clicks", 0),
-                        "impressions": row.get("Impressions", 0),
-                        "avg_position": round(row.get("AvgClickPosition", 0), 1),
-                        "month": month_str[:7],
-                    })
-
-        if current.month == 12:
-            current = current.replace(year=current.year + 1, month=1)
-        else:
-            current = current.replace(month=current.month + 1)
-
-        time.sleep(0.3)
-
-    # 合并同一关键词跨月数据
-    aggregated: dict[str, dict] = {}
-    for row in raw:
-        q = row["query"]
-        if q not in aggregated:
-            aggregated[q] = {"query": q, "clicks": 0, "impressions": 0, "positions": []}
-        aggregated[q]["clicks"] += row["clicks"]
-        aggregated[q]["impressions"] += row["impressions"]
-        if row["avg_position"] > 0:
-            aggregated[q]["positions"].append(row["avg_position"])
-
-    result = []
-    for q_data in aggregated.values():
-        positions = q_data.pop("positions")
-        q_data["avg_position"] = round(sum(positions) / len(positions), 1) if positions else 0
-        q_data["ctr"] = round(
-            q_data["clicks"] / q_data["impressions"], 4
-        ) if q_data["impressions"] > 0 else 0
-        result.append(q_data)
-
-    result.sort(key=lambda x: x["clicks"], reverse=True)
-    return result
+    results.sort(key=lambda x: x["clicks"], reverse=True)
+    return results
 
 
 def fetch_page_stats(site_url: str, api_key: str) -> list[dict]:
