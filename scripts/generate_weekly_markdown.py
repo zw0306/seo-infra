@@ -600,6 +600,73 @@ def generate_report(args) -> str:
                 lines.append(f"- {t['topic']} ({t.get('traffic', 'N/A')})")
         lines.append("")
 
+    # Section 10：Bing 搜索数据（可选）
+    bing_dir = getattr(args, "bing_dir", None)
+    if bing_dir:
+        from pathlib import Path as _Path
+        import json as _json
+        queries_file = _Path(bing_dir) / "queries.json"
+        if queries_file.exists():
+            try:
+                bing_data = _json.loads(queries_file.read_text(encoding="utf-8"))
+                this_week = bing_data.get("this_week", [])
+                prev_week = bing_data.get("prev_week", [])
+                week_date = bing_data.get("week_date", "")
+                prev_week_date = bing_data.get("prev_week_date", "")
+
+                if this_week:
+                    total_clicks = sum(r["clicks"] for r in this_week)
+                    total_impr   = sum(r["impressions"] for r in this_week)
+                    avg_ctr      = total_clicks / total_impr if total_impr > 0 else 0
+                    w_pos_sum    = sum(r["avg_position"] * r["impressions"] for r in this_week if r["avg_position"] > 0)
+                    w_pos_impr   = sum(r["impressions"] for r in this_week if r["avg_position"] > 0)
+                    avg_pos      = round(w_pos_sum / w_pos_impr, 1) if w_pos_impr > 0 else 0
+
+                    prev_clicks  = sum(r["clicks"] for r in prev_week) if prev_week else 0
+                    prev_impr    = sum(r["impressions"] for r in prev_week) if prev_week else 0
+
+                    # 周标题
+                    section_num = "10" if trends_angles else "9"
+                    lines += [f"## {section_num}. 🔵 Bing 搜索数据（{week_date} 周快照）", ""]
+
+                    # 总览表
+                    lines += ["### 流量总览", "",
+                              "| 指标 | 本周 | 上周 | 变化 |",
+                              "|---|---|---|---|"]
+                    click_chg = pct_change(total_clicks, prev_clicks) if prev_clicks else "—"
+                    impr_chg  = pct_change(total_impr, prev_impr) if prev_impr else "—"
+                    lines.append(f"| 点击数（Top 100 词合计）| {total_clicks:,} | {prev_clicks:,} | {click_chg} |")
+                    lines.append(f"| 曝光量 | {total_impr:,} | {prev_impr:,} | {impr_chg} |")
+                    lines.append(f"| 平均 CTR | {avg_ctr:.1%} | — | — |")
+                    lines.append(f"| 加权平均排名 | {avg_pos} | — | — |")
+                    lines.append("")
+
+                    # Top 10 关键词
+                    lines += ["### Top 10 关键词（按点击）", "",
+                              "| 关键词 | 点击 | 曝光 | CTR | 排名 |",
+                              "|---|---|---|---|---|"]
+                    for row in this_week[:10]:
+                        ctr_str = f"{row['ctr']:.1%}"
+                        pos_str = str(row["avg_position"]) if row["avg_position"] > 0 else "—"
+                        lines.append(f"| {row['query']} | {row['clicks']:,} | {row['impressions']:,} | {ctr_str} | {pos_str} |")
+                    lines.append("")
+
+                    # CTR 优化机会
+                    opps = [r for r in this_week if r["impressions"] >= 100 and r["ctr"] < 0.03]
+                    opps.sort(key=lambda x: x["impressions"], reverse=True)
+                    if opps:
+                        lines += ["### ⚡ CTR 优化机会（曝光≥100，CTR<3%）", "",
+                                  "> 这些关键词已有大量曝光但点击率极低，优化标题/Meta 描述可直接提升 Bing 流量。", "",
+                                  "| 关键词 | 曝光 | CTR | 排名 | 建议 |",
+                                  "|---|---|---|---|---|"]
+                        for row in opps[:8]:
+                            pos_str = str(row["avg_position"]) if row["avg_position"] > 0 else "—"
+                            lines.append(f"| {row['query']} | {row['impressions']:,} | {row['ctr']:.1%} | {pos_str} | 重写 Title/Meta |")
+                        lines.append("")
+            except Exception as e:
+                lines.append(f"> ⚠️ Bing 数据加载失败: {e}")
+                lines.append("")
+
     return "\n".join(lines)
 
 
@@ -611,6 +678,7 @@ def main():
     parser.add_argument("--trends",   default=None,  help="trend_scout.py 输出的 JSON 路径（可选）")
     parser.add_argument("--domain",   required=True, help="站点域名")
     parser.add_argument("--out",      required=True, help="输出 Markdown 文件路径")
+    parser.add_argument("--bing-dir", default=None,  help="Bing 数据目录（可选），由 fetch_bing.py 生成")
     args = parser.parse_args()
 
     print(f"\n🚀 生成 SEO Markdown 周报: {args.domain}")

@@ -257,12 +257,17 @@ jobs:
           python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu || true
           python3 -m pip install sentence-transformers scikit-learn || echo "⚠️ 聚类依赖包安装失败"
           REPORT_NAME_MD="SEO-Weekly-Markdown-$DOMAIN-$(date +%Y%m%d).md"
+          MARKDOWN_BING_ARG=""
+          if [ -d "$TMP_DIR/bing" ]; then
+            MARKDOWN_BING_ARG="--bing-dir $TMP_DIR/bing"
+          fi
           python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/generate_weekly_markdown.py" \
             --gsc-this "$TMP_DIR/gsc.json" \
             --gsc-last "$TMP_DIR/gsc_last.json" \
             --ga4-14d  "$TMP_DIR/ga4_14d.json" \
             --domain   "$DOMAIN" \
-            --out      "$REPORT_DIR/$REPORT_NAME_MD" || echo "⚠️ Markdown 周报生成失败，不阻断主流程"
+            --out      "$REPORT_DIR/$REPORT_NAME_MD" \
+            $MARKDOWN_BING_ARG || echo "⚠️ Markdown 周报生成失败，不阻断主流程"
 
           # 13b. 运行 Trend Scout（免费数据源：Google Trends/HN/Reddit）
           echo "🔥 运行 Trend Scout..."
@@ -274,16 +279,16 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/trend_scout.py" $TREND_ARGS \
             || echo "⚠️ Trend Scout 失败，跳过（不阻断主流程）"
 
-          # 13c. 将趋势数据并入 Markdown 周报
+          # 13c. 将趋势数据并入 Markdown 周报（同时保留 Bing 数据）
           if [ -f "$TMP_DIR/trends.json" ]; then
-            REPORT_NAME_MD_FULL="SEO-Weekly-Full-$DOMAIN-$(date +%Y%m%d).md"
             python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/generate_weekly_markdown.py" \
               --gsc-this "$TMP_DIR/gsc.json" \
               --gsc-last "$TMP_DIR/gsc_last.json" \
               --ga4-14d  "$TMP_DIR/ga4_14d.json" \
               --trends   "$TMP_DIR/trends.json" \
               --domain   "$DOMAIN" \
-              --out      "$REPORT_DIR/$REPORT_NAME_MD" || echo "⚠️ 全量 Markdown 周报生成失败"
+              --out      "$REPORT_DIR/$REPORT_NAME_MD" \
+              $MARKDOWN_BING_ARG || echo "⚠️ 全量 Markdown 周报生成失败"
             echo "✅ 已将趋势数据并入 Markdown 周报"
           fi
 
