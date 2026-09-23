@@ -159,9 +159,10 @@ jobs:
               echo "❌ GA4 拉取失败"; cat "$TMP_DIR/ga4.json"; exit 1
           fi
 
-          # 3. PageSpeed 数据
+          # 3. PageSpeed 数据（容错处理，避免 500 错误阻断）
           if ! claude-seo run pagespeed_check.py "https://$DOMAIN/" --json > "$TMP_DIR/psi.json"; then
-              echo "❌ PageSpeed 拉取失败"; cat "$TMP_DIR/psi.json"; exit 1
+              echo "⚠️ PageSpeed 拉取失败 (可能遇到 API 500 错误)，跳过"
+              echo "{}" > "$TMP_DIR/psi.json"
           fi
 
           # 4. 网页收录状态

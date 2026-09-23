@@ -203,10 +203,10 @@ def calc_opportunity_score(impressions, avg_position, ctr, intent) -> float:
     ) * w, 2)
 
 
-def analyze_topic_clusters(query_rows: list) -> list:
+def analyze_topic_clusters(query_rows: list) -> tuple:
     """语义聚类，优先 sentence-transformers + KMeans，不可用时规则降级。"""
     if not query_rows:
-        return []
+        return [], False
 
     # 归一化并聚合统计
     query_stats = {}
