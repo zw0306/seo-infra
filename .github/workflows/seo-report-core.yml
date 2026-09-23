@@ -141,6 +141,9 @@ jobs:
           TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
           BING_API_KEY: ${{ secrets.BING_API_KEY }}
         run: |
+          # 安装必要的 Python 库 (requests 给 fetch_bing.py 使用)
+          python3 -m pip install requests || true
+
           WORKSPACE=$GITHUB_WORKSPACE
           REPORT_DIR="$WORKSPACE/reports/seo-weekly"
           TMP_DIR="$WORKSPACE/reports/tmp"
