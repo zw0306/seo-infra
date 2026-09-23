@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: ""
+      bing_site_url:
+        description: "Bing 站点 URL，例如 https://piano-sheets.org/（可选，留空则自动推断）"
+        required: false
+        type: string
+        default: ""
     secrets:
       GOOGLE_API_KEY:
         required: true
@@ -25,6 +30,8 @@ on:
         required: true
       TELEGRAM_TARGET_CHAT:
         required: true
+      BING_API_KEY:
+        required: false
 
 jobs:
   generate-seo-report:
@@ -132,6 +139,7 @@ jobs:
           SEO_NICHE_KEYWORDS: ${{ inputs.seo_niche_keywords }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+          BING_API_KEY: ${{ secrets.BING_API_KEY }}
         run: |
           WORKSPACE=$GITHUB_WORKSPACE
           REPORT_DIR="$WORKSPACE/reports/seo-weekly"
@@ -192,6 +200,25 @@ jobs:
           if [ -f "$PREV_SNAPSHOT" ]; then
               SUMMARY_ARGS="$SUMMARY_ARGS --prev $PREV_SNAPSHOT"
           fi
+
+          # 9b. 拉取 Bing 数据（可选，不阻断主流程）
+          if [ -n "$BING_API_KEY" ]; then
+            echo "🔵 检测到 BING_API_KEY，开始拉取 Bing 数据..."
+            BING_SITE_URL="${{ inputs.bing_site_url }}"
+            export BING_SITE_URL
+            python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/fetch_bing.py" \
+              --domain "$DOMAIN" \
+              --out-dir "$TMP_DIR/bing" \
+              && echo "✅ Bing 数据拉取完成" \
+              || echo "⚠️ Bing 数据拉取失败，跳过（不阻断主流程）"
+
+            if [ -d "$TMP_DIR/bing" ]; then
+              SUMMARY_ARGS="$SUMMARY_ARGS --bing-dir $TMP_DIR/bing"
+            fi
+          else
+            echo "ℹ️  未配置 BING_API_KEY，跳过 Bing 数据拉取"
+          fi
+
           python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/seo_weekly_summary.py" $SUMMARY_ARGS
 
           # 10. 合并数据生成 HTML 报告
@@ -293,6 +320,10 @@ jobs:
           cp "$TMP_DIR/psi.json" "$ARCHIVE_DIR/pagespeed.json" || true
           cp "$TMP_DIR/inspection.json" "$ARCHIVE_DIR/inspection.json" || true
           cp "$TMP_DIR/trends.json" "$ARCHIVE_DIR/trends.json" || true
+          if [ -d "$TMP_DIR/bing" ]; then
+            cp -r "$TMP_DIR/bing" "$ARCHIVE_DIR/bing" || true
+            echo "✅ Bing 数据已归档"
+          fi
           
           if [ -f "$REPORT_DIR/$REPORT_NAME_MD" ]; then
               cp "$REPORT_DIR/$REPORT_NAME_MD" "$ARCHIVE_DIR/SEO-Weekly-Report.md"

@@ -321,6 +321,98 @@ def build_telegram_message(
 
 
 # ──────────────────────────────────────────────
+# Bing 数据段生成（可选）
+# ──────────────────────────────────────────────
+
+def build_bing_section(bing_dir: Path) -> str:
+    """
+    读取 fetch_bing.py 输出的 queries.json，生成 Bing 摘要文字段落。
+    包含：总流量、Top 10 关键词、CTR 优化机会词。
+    """
+    queries_file = bing_dir / "queries.json"
+    if not queries_file.exists():
+        return ""
+
+    try:
+        with open(queries_file, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return ""
+
+    this_week = data.get("this_week", [])
+    prev_week = data.get("prev_week", [])
+    week_date = data.get("week_date", "")
+
+    if not this_week:
+        return ""
+
+    # 汇总统计
+    total_clicks = sum(r["clicks"] for r in this_week)
+    total_impr = sum(r["impressions"] for r in this_week)
+    avg_ctr = total_clicks / total_impr if total_impr > 0 else 0
+
+    # 上周总点击（环比）
+    prev_total_clicks = sum(r["clicks"] for r in prev_week) if prev_week else 0
+
+    lines = []
+    lines.append("─────────────────────")
+    lines.append(f"*🔵 Bing 搜索（本周快照，{week_date}）*")
+
+    # 总点击 + 环比
+    if prev_total_clicks > 0:
+        delta = total_clicks - prev_total_clicks
+        sign = "+" if delta >= 0 else ""
+        arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
+        lines.append(f"点击数　 {total_clicks:,} {arrow} {sign}{delta:,} vs 上周")
+    else:
+        lines.append(f"点击数　 {total_clicks:,}（Top 100 词合计）")
+
+    lines.append(f"曝光量　 {total_impr:,}")
+
+    # 加权平均排名
+    positions = [r["avg_position"] for r in this_week if r["avg_position"] > 0]
+    if positions:
+        weighted_pos = sum(
+            r["avg_position"] * r["impressions"]
+            for r in this_week if r["avg_position"] > 0
+        ) / sum(r["impressions"] for r in this_week if r["avg_position"] > 0)
+        lines.append(f"平均排名 {weighted_pos:.1f}")
+
+    lines.append(f"平均 CTR {avg_ctr:.1%}")
+    lines.append("")
+
+    # Top 10 关键词
+    lines.append("*Top 10 关键词：*")
+    for i, row in enumerate(this_week[:10], 1):
+        q = row["query"]
+        if len(q) > 28:
+            q = q[:25] + "…"
+        ctr_str = f"{row['ctr']:.0%}"
+        pos_str = f"排名{row['avg_position']}" if row["avg_position"] > 0 else ""
+        lines.append(f"{i}. {q} — {row['clicks']}次 {pos_str} CTR {ctr_str}")
+
+    # CTR 优化机会（曝光≥100 且 CTR<3%）
+    opportunities = [
+        r for r in this_week
+        if r["impressions"] >= 100 and r["ctr"] < 0.03 and r["clicks"] < r["impressions"] * 0.03
+    ]
+    opportunities.sort(key=lambda x: x["impressions"], reverse=True)
+
+    if opportunities:
+        lines.append("")
+        lines.append("*⚡ CTR 优化机会（曝光≥100，CTR<3%）：*")
+        for row in opportunities[:5]:
+            q = row["query"]
+            if len(q) > 24:
+                q = q[:21] + "…"
+            lines.append(
+                f"「{q}」曝光{row['impressions']:,} CTR {row['ctr']:.1%}"
+            )
+
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 # 快照存储
 # ──────────────────────────────────────────────
 
@@ -351,6 +443,7 @@ def main():
     parser.add_argument("--indexed", type=int, default=None, help="已收录页面数（可选）")
     parser.add_argument("--out", default="telegram.txt", help="输出 Telegram 消息文件路径")
     parser.add_argument("--snapshot", default="snapshot.json", help="本周快照输出路径")
+    parser.add_argument("--bing-dir", default=None, help="Bing 数据目录（可选），由 fetch_bing.py 生成")
     args = parser.parse_args()
 
     # 读取输入
@@ -380,6 +473,19 @@ def main():
         indexed_count=args.indexed,
         week_num=args.week,
     )
+
+    # 追加 Bing 段落（可选）
+    if args.bing_dir:
+        bing_dir = Path(args.bing_dir)
+        bing_section = build_bing_section(bing_dir)
+        if bing_section:
+            # 移除原有的结尾行，插入 Bing 段落后再加回来
+            if message.endswith("完整报告见附件 👆"):
+                message = message[: message.rfind("─────────────────────")]
+            message = message.rstrip() + "\n" + bing_section + "\n─────────────────────\n完整报告见附件 👆"
+            print("✅ 已追加 Bing 数据段落")
+        else:
+            print("ℹ️  Bing 数据为空或未找到，跳过 Bing 段落")
 
     # 写出 Telegram 消息
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
