@@ -152,8 +152,17 @@ jobs:
 
           echo "开始拉取 SEO 数据..."
 
-          # 1. GSC 7天数据
-          if ! claude-seo run gsc_query.py query -p "$PROPERTY" --days 7 --json > "$TMP_DIR/gsc.json"; then
+          # 计算统一周报周期（GSC 有 3 天最终数据延迟）
+          DATA_END=$(date -d "3 days ago" +%Y-%m-%d)
+          THIS_WEEK_START=$(date -d "$DATA_END - 6 days" +%Y-%m-%d)
+          LAST_WEEK_END=$(date -d "$THIS_WEEK_START - 1 day" +%Y-%m-%d)
+          LAST_WEEK_START=$(date -d "$LAST_WEEK_END - 6 days" +%Y-%m-%d)
+          echo "📅 本周: $THIS_WEEK_START → $DATA_END  上周: $LAST_WEEK_START → $LAST_WEEK_END"
+
+          # 1. GSC 本周完整 7 天数据（显式指定起止日期，避免 --days 7 因 3 天延迟实际只返回 5 天）
+          if ! claude-seo run gsc_query.py query -p "$PROPERTY" \
+              --start-date "$THIS_WEEK_START" --end-date "$DATA_END" \
+              --json > "$TMP_DIR/gsc.json"; then
               echo "❌ GSC 拉取失败"; cat "$TMP_DIR/gsc.json"; exit 1
           fi
 
@@ -175,21 +184,15 @@ jobs:
           fi
 
           # 5. 上周 GSC 数据（用于 Markdown 周报环比）
-          DATA_END=$(date -d "3 days ago" +%Y-%m-%d)
-          THIS_WEEK_START=$(date -d "$DATA_END - 6 days" +%Y-%m-%d)
-          LAST_WEEK_END=$(date -d "$THIS_WEEK_START - 1 day" +%Y-%m-%d)
-          LAST_WEEK_START=$(date -d "$LAST_WEEK_END - 6 days" +%Y-%m-%d)
-          echo "📅 本周: $THIS_WEEK_START → $DATA_END  上周: $LAST_WEEK_START → $LAST_WEEK_END"
-
           claude-seo run gsc_query.py query -p "$PROPERTY" \
             --start-date "$LAST_WEEK_START" --end-date "$LAST_WEEK_END" \
             --json > "$TMP_DIR/gsc_last.json" || echo "{}" > "$TMP_DIR/gsc_last.json"
           echo "✅ 上周 GSC 数据已拉取"
 
-          # 6. GA4 最近 14 天 daily_data
-          claude-seo run ga4_report.py --property "$GA4_PROPERTY" --days 14 \
+          # 6. GA4 最近 16 天 daily_data（覆盖 T-16 → T-1，确保包含上周 T-16 → T-10 完整 7 天）
+          claude-seo run ga4_report.py --property "$GA4_PROPERTY" --days 16 \
             --json > "$TMP_DIR/ga4_14d.json" || echo "{}" > "$TMP_DIR/ga4_14d.json"
-          echo "✅ GA4 14天数据已拉取"
+          echo "✅ GA4 16天数据已拉取"
 
           # 7. 提取辅助变量
           PSI_SCORE=$(jq '.categories.performance.score // 0 | (. * 100) | floor' "$TMP_DIR/psi.json" 2>/dev/null || echo "0")
