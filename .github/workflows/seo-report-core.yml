@@ -94,9 +94,6 @@ jobs:
             cd -
           fi
 
-          # 热修复：防止 Lighthouse 标题里的 <html> 或反引号注入导致报告内容消失
-          python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/patch_report_escaping.py"
-
           # 创建全局执行命令
           mkdir -p ~/.local/bin
           echo '#!/usr/bin/env bash' > ~/.local/bin/claude-seo
@@ -106,8 +103,8 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-          echo "Running claude-seo setup..."
-          claude-seo setup
+          echo "Running claude-seo setup (--skip-browser)..."
+          claude-seo setup --skip-browser
 
       - name: Configure Google API Environment
         env:
@@ -228,37 +225,7 @@ jobs:
 
           python3 "$GITHUB_WORKSPACE/.seo-infra/scripts/seo_weekly_summary.py" $SUMMARY_ARGS
 
-          # 10. 合并数据生成 HTML 报告
-          echo "合并底层数据..."
-          jq -s '.[0] as $gsc | .[1] as $ga4 | .[2] as $psi | .[3] as $inspection | {gsc: $gsc, ga4: $ga4, psi: $psi, inspection: $inspection}' \
-              "$TMP_DIR/gsc.json" "$TMP_DIR/ga4.json" "$TMP_DIR/psi.json" "$TMP_DIR/inspection.json" > "$TMP_DIR/full_data.json"
-
-          REPORT_NAME_HTML="Google-SEO-Weekly-$DOMAIN-$(date +%Y%m%d).html"
-          echo "正在生成 HTML 报告..."
-          claude-seo run google_report.py --type full --data "$TMP_DIR/full_data.json" --domain "$DOMAIN" --output-dir "$REPORT_DIR" --format html
-
-          if [ ! -f "$REPORT_DIR/Google-SEO-Report-$DOMAIN-full.html" ]; then
-              echo "❌ HTML 报告生成失败！"; exit 1
-          fi
-          mv "$REPORT_DIR/Google-SEO-Report-$DOMAIN-full.html" "$REPORT_DIR/$REPORT_NAME_HTML"
-          echo "✅ HTML 报告: $REPORT_DIR/$REPORT_NAME_HTML"
-
-          # 11. 发送 Telegram 文字摘要
-          TELEGRAM_TEXT=$(cat "$TMP_DIR/telegram.txt")
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_TARGET_CHAT}" \
-              -d parse_mode="Markdown" \
-              --data-urlencode "text=${TELEGRAM_TEXT}" > /dev/null
-          echo "✅ Telegram 文字摘要已发送"
-
-          # 12. 发送 HTML 附件
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F chat_id="${TELEGRAM_TARGET_CHAT}" \
-              -F document=@"$REPORT_DIR/$REPORT_NAME_HTML" \
-              -F caption="📎 完整 SEO 报告 · $DOMAIN · $(date +%Y-%m-%d)" > /dev/null
-          echo "✅ Telegram HTML 附件已发送"
-
-          # 13. 生成 Markdown 周报（语义聚类分析）
+          # 10. 生成 Markdown 周报（语义聚类分析）
           python3 -m pip install --upgrade pip || true
           # 明确安装 CPU 版的 torch，避免下载 3GB 的 CUDA 库导致 "No space left on device"
           python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu || true
@@ -275,7 +242,16 @@ jobs:
             --domain   "$DOMAIN" \
             --out      "$REPORT_DIR/$REPORT_NAME_MD" \
             $MARKDOWN_BING_ARG || echo "⚠️ Markdown 周报生成失败，不阻断主流程"
-          # 14. 发送 Markdown 周报到 Telegram
+
+          # 11. 发送 Telegram 文字摘要
+          TELEGRAM_TEXT=$(cat "$TMP_DIR/telegram.txt")
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_TARGET_CHAT}" \
+              -d parse_mode="Markdown" \
+              --data-urlencode "text=${TELEGRAM_TEXT}" > /dev/null
+          echo "✅ Telegram 文字摘要已发送"
+
+          # 12. 发送 Markdown 周报到 Telegram
           if [ -f "$REPORT_DIR/$REPORT_NAME_MD" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
               -F chat_id="${TELEGRAM_TARGET_CHAT}" \
@@ -284,11 +260,11 @@ jobs:
             echo "✅ Telegram Markdown 周报已发送"
           fi
 
-          # 15. 更新快照（本周 → 成为下周的上周）
+          # 13. 更新快照（本周 → 成为下周的上周）
           cp "$TMP_DIR/snapshot-this.json" "$PREV_SNAPSHOT"
           echo "✅ 快照已更新: $PREV_SNAPSHOT"
 
-          # 16. 按日期归档原始数据和报表
+          # 14. 按日期归档原始数据和报表
           DATE_STR=$(date +%Y-%m-%d)
           ARCHIVE_DIR="$WORKSPACE/reports/archive/$DATE_STR"
           mkdir -p "$ARCHIVE_DIR"
