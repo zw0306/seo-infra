@@ -174,8 +174,19 @@ jobs:
               echo "{}" > "$TMP_DIR/psi.json"
           fi
 
-          # 4. 网页收录状态
-          echo "https://$DOMAIN/" > "$TMP_DIR/urls_to_inspect.txt"
+          # 4. 网页收录状态（首页 + 本周 Top 9 流量页）
+          {
+            echo "https://$DOMAIN/"
+            jq -r --arg dom "$DOMAIN" '
+              (.rows // [])
+              | group_by(.page // .keys[1] // "")
+              | map({page: (.[0].page // .[0].keys[1] // ""), clicks: (map(.clicks // 0) | add)})
+              | sort_by(-.clicks)
+              | map(.page)
+              | map(select(length > 0 and contains($dom)))
+              | .[:9][]
+            ' "$TMP_DIR/gsc.json" 2>/dev/null || true
+          } | awk '!seen[$0]++' | head -n 10 > "$TMP_DIR/urls_to_inspect.txt"
           if ! claude-seo run gsc_inspect.py -s "$PROPERTY" --batch "$TMP_DIR/urls_to_inspect.txt" --json > "$TMP_DIR/inspection.json"; then
               echo "❌ GSC Inspect 拉取失败"; cat "$TMP_DIR/inspection.json"; exit 1
           fi
@@ -193,7 +204,7 @@ jobs:
 
           # 7. 提取辅助变量
           PSI_SCORE=$(jq '.categories.performance.score // 0 | (. * 100) | floor' "$TMP_DIR/psi.json" 2>/dev/null || echo "0")
-          INDEXED_COUNT=$(jq '.indexed_count // 1' "$TMP_DIR/inspection.json" 2>/dev/null || echo "1")
+          INDEXED_COUNT=$(jq '.summary.pass // 0' "$TMP_DIR/inspection.json" 2>/dev/null || echo "0")
           WEEK_NUM=$(date +%V)
 
           # 8. 加载上周快照（如存在）

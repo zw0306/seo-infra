@@ -1,0 +1,144 @@
+name: "SEO Monitor Core (Reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      seo_domain:
+        description: "站点域名，例如 krillion-game.app（不含 https://）"
+        required: true
+        type: string
+      ga4_property_id:
+        description: "GA4 纯数字 Property ID（可选，留空跳过 GA4 检查）"
+        required: false
+        type: string
+        default: ""
+      monitor_urls:
+        description: "附加核心监控 URL 或路径，逗号分隔（可选；默认自动含首页 + Top 10 点击页）"
+        required: false
+        type: string
+        default: ""
+      max_inspect_urls:
+        description: "单次 URL Inspection 最多巡检数量"
+        required: false
+        type: number
+        default: 15
+      snapshot_path:
+        description: "GSC 快照相对路径（用于自动提取 Top 流量页）"
+        required: false
+        type: string
+        default: "reports/snapshots/gsc-snapshot-prev.json"
+      drop_warn_pct:
+        description: "流量下跌 P1 预警阈值百分比"
+        required: false
+        type: string
+        default: "40"
+      drop_crit_pct:
+        description: "流量下跌 P0 紧急阈值百分比"
+        required: false
+        type: string
+        default: "60"
+      cooldown_hours:
+        description: "相同告警重复推送冷却小时数"
+        required: false
+        type: string
+        default: "24"
+      send_summary:
+        description: "即使全部正常也发送一条巡检回执（适合手动测试）"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      GOOGLE_SERVICE_ACCOUNT_JSON:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: true
+      TELEGRAM_TARGET_CHAT:
+        required: true
+
+jobs:
+  seo-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Caller Repository
+        uses: actions/checkout@v4
+
+      - name: Checkout seo-infra Scripts
+        uses: actions/checkout@v4
+        with:
+          repository: zw0306/seo-infra
+          ref: main
+          path: .seo-infra
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: .seo-infra/requirements-monitor.txt
+
+      - name: Install Monitor Dependencies
+        run: python3 -m pip install -r .seo-infra/requirements-monitor.txt
+
+      - name: Restore Monitor State Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .seo-monitor-cache
+          key: seo-monitor-state-${{ inputs.seo_domain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            seo-monitor-state-${{ inputs.seo_domain }}-
+
+      - name: Run SEO Health Monitor
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+          SEO_DOMAIN: ${{ inputs.seo_domain }}
+          GA4_PROPERTY_ID: ${{ inputs.ga4_property_id }}
+          MONITOR_URLS: ${{ inputs.monitor_urls }}
+          MAX_INSPECT_URLS: ${{ inputs.max_inspect_urls }}
+          SNAPSHOT_PATH: ${{ inputs.snapshot_path }}
+          DROP_WARN_PCT: ${{ inputs.drop_warn_pct }}
+          DROP_CRIT_PCT: ${{ inputs.drop_crit_pct }}
+          COOLDOWN_HOURS: ${{ inputs.cooldown_hours }}
+          SEND_SUMMARY: ${{ inputs.send_summary }}
+        run: |
+          ARGS=(
+            --domain "$SEO_DOMAIN"
+            --max-inspect-urls "$MAX_INSPECT_URLS"
+            --warn-pct "$DROP_WARN_PCT"
+            --crit-pct "$DROP_CRIT_PCT"
+            --cooldown-hours "$COOLDOWN_HOURS"
+            --state ".seo-monitor-cache/monitor-state.json"
+            --out-json "/tmp/seo-monitor-report.json"
+          )
+          if [ -n "$GA4_PROPERTY_ID" ]; then
+            ARGS+=(--ga4-property "$GA4_PROPERTY_ID")
+          fi
+          if [ -n "$MONITOR_URLS" ]; then
+            ARGS+=(--urls "$MONITOR_URLS")
+          fi
+          if [ -n "$SNAPSHOT_PATH" ] && [ -f "$SNAPSHOT_PATH" ]; then
+            ARGS+=(--snapshot "$SNAPSHOT_PATH")
+          fi
+          if [ "$SEND_SUMMARY" = "true" ]; then
+            ARGS+=(--send-summary)
+          fi
+          python3 .seo-infra/scripts/seo_health_monitor.py "${ARGS[@]}"
+
+      - name: Save Monitor State Cache
+        if: always() && hashFiles('.seo-monitor-cache/monitor-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .seo-monitor-cache
+          key: seo-monitor-state-${{ inputs.seo_domain }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload Monitor Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seo-monitor-report-${{ inputs.seo_domain }}
+          path: /tmp/seo-monitor-report.json
+          retention-days: 7
+          if-no-files-found: ignore

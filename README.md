@@ -7,14 +7,16 @@ SEO 报表基础设施仓库，集中管理所有项目通用的 SEO 周报自�
 ```
 .github/workflows/
   seo-report-core.yml       # Google SEO 周报（Reusable Workflow）
-  bing-report-core.yml      # Bing SEO 月报（Reusable Workflow，可选）
+  seo-monitor-core.yml      # SEO 异常健康监控与告警（Reusable Workflow）
 scripts/
+  seo_health_monitor.py       # HTTP / GSC 抓取收录 / Sitemap / GSC+GA4 流量异动监控
   seo_weekly_summary.py       # Telegram 极简摘要生成
   generate_weekly_markdown.py # 语义聚类深度周报生成（支持 CTR 异常词分析 + 趋势 Section）
-  trend_scout.py              # 多源趋势监控（Google Trends/HN/Reddit，全免费）
   patch_report_escaping.py    # claude-seo 热修复补丁
   fetch_bing.py               # Bing Webmaster Tools 数据拉取
   report_bing.py              # Bing SEO 月报生成（含 GSC 双引擎对比）
+tests/
+  test_seo_health_monitor.py  # 监控脚本单元测试
 ```
 
 ## 如何在新项目中接入
@@ -108,3 +110,45 @@ jobs:
 - **快速优化机会**：高曝光低 CTR 词（曝光 ≥ 100，CTR < 3%）
 - **抓取错误列表**：Bing 无法抓取的 URL 及错误类型
 - **Google vs Bing 双引擎对比**：仅 Bing 有流量的词（Google 内容缺口）、仅 Google 有流量的词（Bing 机会词）、双引擎共有热词
+
+---
+
+## SEO 异常健康监控（`seo-monitor-core.yml`）
+
+面向所有接入站点的轻量级巡检工作流：默认全绿静默，发现 `403 ACCESS_FORBIDDEN`、掉索引、`noindex`、Sitemap 报错、或流量同比同星期大幅下跌时立刻推送 Telegram（带 24h 冷却去重与恢复通知闭环，状态通过 `actions/cache` 保存，不污染业务仓库 git log）。
+
+在业务项目仓库创建 `.github/workflows/seo-monitor.yml`：
+
+```yaml
+name: "SEO Health Monitor"
+
+on:
+  schedule:
+    - cron: '18 2,10,18 * * *' # 每 8 小时巡检一次（UTC 02:18 / 10:18 / 18:18）
+  workflow_dispatch:
+    inputs:
+      send_summary:
+        description: "即使巡检全绿也发送 Telegram 回执（测试用）"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  seo-monitor:
+    uses: zw0306/seo-infra/.github/workflows/seo-monitor-core.yml@main
+    with:
+      seo_domain: ${{ vars.SEO_DOMAIN }}
+      ga4_property_id: ${{ vars.GA4_PROPERTY_ID }}
+      monitor_urls: "/noillirk/,/puffer-party/,/unlimited/"
+      send_summary: ${{ inputs.send_summary == true }}
+    secrets:
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+```
+
+### 运行单元测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
