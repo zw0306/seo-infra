@@ -44,6 +44,9 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (compatible; SEOInfraMonitor/1.0; +https://github.com/zw0306/seo-infra)"
 )
 MAX_TELEGRAM_CHARS = 3800
+GSC_PAGE_ROW_LIMIT = 25000
+GSC_MAX_PAGE_PAGES = 4
+MIN_BYPAGE_COVERAGE_RATIO = 0.2
 
 CRITICAL_FETCH_STATES = {
     "ACCESS_FORBIDDEN",
@@ -102,6 +105,16 @@ class HtmlSeoParser(HTMLParser):
 # ──────────────────────────────────────────────
 # URL & Config Helpers
 # ──────────────────────────────────────────────
+
+def _parse_iso_date(raw: Any) -> date | None:
+    """Safely parse a YYYY-MM-DD string into a date, returning None if invalid."""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
 
 def clean_domain(raw_domain: str) -> str:
     """Normalize domain string by removing scheme, slashes, and whitespace."""
@@ -748,10 +761,27 @@ def evaluate_gsc_inspection_result(
         p0_reasons.append(f"索引受阻: {indexing_state}")
         sig_parts.append(f"idx:{indexing_state}")
 
-    was_pass = (prev_verdict_info or {}).get("verdict") == "PASS"
+    prev_verdict = (prev_verdict_info or {}).get("verdict")
+    was_pass = prev_verdict == "PASS"
+    was_neutral = prev_verdict == "NEUTRAL"
     is_core_traffic_page = path == "/" or known_traffic_clicks >= 10
-    if verdict in {"FAIL", "NEUTRAL"} and (was_pass or is_core_traffic_page):
-        if verdict == "FAIL" or was_pass or known_traffic_clicks >= 20:
+    is_healthy_live_http = (
+        http_status == 200
+        and fetch_state in {"", "SUCCESSFUL", "PAGE_FETCH_STATE_UNSPECIFIED"}
+        and robots_state in {"", "ALLOWED", "ROBOTS_TXT_STATE_UNSPECIFIED"}
+        and indexing_state in {"", "INDEXING_ALLOWED", "INDEXING_STATE_UNSPECIFIED"}
+    )
+    is_transient_neutral = (
+        verdict == "NEUTRAL"
+        and path != "/"
+        and is_healthy_live_http
+        and not was_neutral
+    )
+    if verdict in {"FAIL", "NEUTRAL"} and (was_pass or is_core_traffic_page or was_neutral):
+        if is_transient_neutral:
+            p1_reasons.append(f"索引状态 {verdict} ({coverage_state or '未知原因'})")
+            sig_parts.append(f"verdict:{verdict}")
+        elif verdict == "FAIL" or was_pass or was_neutral or known_traffic_clicks >= 20:
             p0_reasons.append(f"索引状态 {verdict} ({coverage_state or '未知原因'})")
             sig_parts.append(f"verdict:{verdict}")
         else:
@@ -767,6 +797,11 @@ def evaluate_gsc_inspection_result(
             diag_note = (
                 "\n• 诊断提示: GSC 报 403 ACCESS_FORBIDDEN 但 GitHub 拨测返回 200，"
                 "极大概率 Cloudflare WAF / Bot Fight Mode 拦截了 Googlebot (AS15169)。"
+            )
+        elif is_transient_neutral:
+            diag_note = (
+                "\n• 诊断提示: 本次实时 HTTP 自检返回 200 正常，若上次抓取正值发版或缓存刷新窗口，"
+                "可能是临时性波动；若下轮仍未恢复将升级为 P0 告警。"
             )
         detail_lines = [
             f"URL: {url}",
@@ -897,6 +932,26 @@ def compute_same_weekday_baseline(
     return None, "insufficient_history"
 
 
+def _resolve_complete_t2_date(
+    today_utc: date,
+    daily_totals: dict[date, dict[str, float]],
+    first_incomplete_date: date | None,
+) -> date | None:
+    """
+    Pick the latest complete T-2 (or fallback T-3) date for GSC checks.
+    Skips dates >= firstIncompleteDate so incomplete GSC rollups do not false-alarm.
+    """
+    t2_date = today_utc - timedelta(days=2)
+    if first_incomplete_date is None or t2_date < first_incomplete_date:
+        return t2_date
+
+    # Step back at most 1 day to T-3 if GSC already finalized T-3; otherwise wait for next run.
+    t3_date = today_utc - timedelta(days=3)
+    if t3_date < first_incomplete_date and t3_date in daily_totals:
+        return t3_date
+    return None
+
+
 def evaluate_gsc_traffic_series(
     daily_totals: dict[date, dict[str, float]],
     daily_by_page: dict[str, dict[date, dict[str, float]]],
@@ -907,25 +962,26 @@ def evaluate_gsc_traffic_series(
     min_site_clicks: float = 20.0,
     min_site_impressions: float = 200.0,
     min_page_clicks: float = 40.0,
+    first_incomplete_date: date | None = None,
 ) -> list[Alert]:
-    """Analyze GSC daily totals and top pages for sudden T-2 drops or T-1 collapse."""
+    """Analyze GSC daily totals and top pages for sudden complete-day drops or T-1 collapse."""
     alerts: list[Alert] = []
     if not daily_totals:
         return alerts
 
     today_utc = now_utc.date()
-    t2_date = today_utc - timedelta(days=2)
     t1_date = today_utc - timedelta(days=1)
+    eval_t2 = _resolve_complete_t2_date(today_utc, daily_totals, first_incomplete_date)
 
     click_series = {d: v.get("clicks", 0.0) for d, v in daily_totals.items()}
     imp_series = {d: v.get("impressions", 0.0) for d, v in daily_totals.items()}
 
-    # 1. Site-wide T-2 check against prior same-weekday median
-    if t2_date in daily_totals:
-        t2_clicks = click_series.get(t2_date, 0.0)
-        t2_imps = imp_series.get(t2_date, 0.0)
-        base_clicks, base_label = compute_same_weekday_baseline(click_series, t2_date)
-        base_imps, _ = compute_same_weekday_baseline(imp_series, t2_date)
+    # 1. Site-wide T-2 (or latest complete) check against prior same-weekday median
+    if eval_t2 is not None and eval_t2 in daily_totals:
+        t2_clicks = click_series.get(eval_t2, 0.0)
+        t2_imps = imp_series.get(eval_t2, 0.0)
+        base_clicks, base_label = compute_same_weekday_baseline(click_series, eval_t2)
+        base_imps, _ = compute_same_weekday_baseline(imp_series, eval_t2)
 
         click_drop = (
             ((base_clicks - t2_clicks) / base_clicks * 100.0)
@@ -944,21 +1000,20 @@ def evaluate_gsc_traffic_series(
                 key="gsc_traffic:site_t2_drop",
                 probe="gsc_traffic",
                 severity=severity,
-                title=f"GSC 全站搜索流量暴跌 ({t2_date.isoformat()})",
+                title=f"GSC 全站搜索流量暴跌 ({eval_t2.isoformat()})",
                 detail=(
                     f"基线口径: {base_label}\n"
                     f"• 点击: {int(t2_clicks):,} vs 基线 {int(base_clicks or 0):,} (-{click_drop:.1f}%)\n"
                     f"• 曝光: {int(t2_imps):,} vs 基线 {int(base_imps or 0):,} (-{imp_drop:.1f}%)"
                 ),
                 url=f"https://{domain}/",
-                signature=f"{t2_date.isoformat()}:{severity}",
+                signature=f"{eval_t2.isoformat()}:{severity}",
             ))
 
-    # 2. Severe T-1 collapse guard (only for high-volume sites so partial lag doesn't spam)
+    # 2. Severe T-1 collapse guard (requires >= 10:00 UTC so early-morning partial release doesn't false-alarm)
     t1_base_clicks, t1_label = compute_same_weekday_baseline(click_series, t1_date)
-    if t1_base_clicks is not None and t1_base_clicks >= 100.0:
+    if now_utc.hour >= 10 and t1_base_clicks is not None and t1_base_clicks >= 100.0:
         t1_clicks = click_series.get(t1_date, 0.0)
-        # Check either after 14:00 UTC or whenever T-1 clicks collapsed >= 95%
         if (t1_date in daily_totals and t1_clicks <= t1_base_clicks * 0.05) or (
             t1_date not in daily_totals and now_utc.hour >= 14
         ):
@@ -975,50 +1030,64 @@ def evaluate_gsc_traffic_series(
                 signature=f"{t1_date.isoformat()}:t1_zero",
             ))
 
-    # 3. Per-page T-2 click & ranking drops on core pages
-    for page_url, page_series in daily_by_page.items():
-        p_clicks = {d: v.get("clicks", 0.0) for d, v in page_series.items()}
-        p_imps = {d: v.get("impressions", 0.0) for d, v in page_series.items()}
-        p_pos = {d: v.get("position", 0.0) for d, v in page_series.items()}
+    # 3. Per-page check on eval_t2, guarded against byPage dimension rollup lag
+    if eval_t2 is not None and daily_by_page:
+        site_day_clicks = click_series.get(eval_t2, 0.0)
+        page_day_clicks = sum(
+            page_series.get(eval_t2, {}).get("clicks", 0.0)
+            for page_series in daily_by_page.values()
+        )
+        by_page_ready = (
+            site_day_clicks < min_site_clicks
+            or page_day_clicks >= site_day_clicks * MIN_BYPAGE_COVERAGE_RATIO
+        )
+    else:
+        by_page_ready = False
 
-        base_p_clicks, _ = compute_same_weekday_baseline(p_clicks, t2_date)
-        if base_p_clicks is None or base_p_clicks < min_page_clicks:
-            continue
+    if eval_t2 is not None and by_page_ready:
+        for page_url, page_series in daily_by_page.items():
+            p_clicks = {d: v.get("clicks", 0.0) for d, v in page_series.items()}
+            p_imps = {d: v.get("impressions", 0.0) for d, v in page_series.items()}
+            p_pos = {d: v.get("position", 0.0) for d, v in page_series.items()}
 
-        curr_clicks = p_clicks.get(t2_date, 0.0)
-        drop_pct = (base_p_clicks - curr_clicks) / base_p_clicks * 100.0
+            base_p_clicks, _ = compute_same_weekday_baseline(p_clicks, eval_t2)
+            if base_p_clicks is None or base_p_clicks < min_page_clicks:
+                continue
 
-        # Check position drop only when impressions had real volume
-        pos_jump = 0.0
-        base_p_imps, _ = compute_same_weekday_baseline(p_imps, t2_date)
-        base_pos_vals = [
-            p_pos[t2_date - timedelta(days=7 * k)]
-            for k in range(1, 5)
-            if (t2_date - timedelta(days=7 * k)) in p_pos and p_pos[t2_date - timedelta(days=7 * k)] > 0
-        ]
-        curr_pos = p_pos.get(t2_date, 0.0)
-        base_pos = float(statistics.median(base_pos_vals)) if base_pos_vals else 0.0
-        if base_pos > 0 and curr_pos > 0 and (base_p_imps or 0) >= 100:
-            pos_jump = curr_pos - base_pos
+            curr_clicks = p_clicks.get(eval_t2, 0.0)
+            drop_pct = (base_p_clicks - curr_clicks) / base_p_clicks * 100.0
 
-        path = short_path(page_url, domain)
-        if drop_pct >= warn_pct or (pos_jump >= 5.0 and drop_pct >= 25.0):
-            severity = "P0" if (drop_pct >= crit_pct or curr_clicks == 0) else "P1"
-            pos_note = (
-                f"\n• 均位变化: {base_pos:.1f} → {curr_pos:.1f} (下降 {pos_jump:.1f} 位)"
-                if pos_jump >= 3.0 else ""
-            )
-            alerts.append(Alert(
-                key=f"gsc_traffic:page:{path}",
-                probe="gsc_traffic",
-                severity=severity,
-                title=f"核心页流量下跌 {drop_pct:.0f}%: {path}",
-                detail=(
-                    f"日期 {t2_date.isoformat()} 点击 {int(curr_clicks):,} vs 同星期基线 {int(base_p_clicks):,}{pos_note}"
-                ),
-                url=page_url,
-                signature=f"{t2_date.isoformat()}:{severity}",
-            ))
+            # Check position drop only when impressions had real volume
+            pos_jump = 0.0
+            base_p_imps, _ = compute_same_weekday_baseline(p_imps, eval_t2)
+            base_pos_vals = [
+                p_pos[eval_t2 - timedelta(days=7 * k)]
+                for k in range(1, 5)
+                if (eval_t2 - timedelta(days=7 * k)) in p_pos and p_pos[eval_t2 - timedelta(days=7 * k)] > 0
+            ]
+            curr_pos = p_pos.get(eval_t2, 0.0)
+            base_pos = float(statistics.median(base_pos_vals)) if base_pos_vals else 0.0
+            if base_pos > 0 and curr_pos > 0 and (base_p_imps or 0) >= 100:
+                pos_jump = curr_pos - base_pos
+
+            path = short_path(page_url, domain)
+            if drop_pct >= warn_pct or (pos_jump >= 5.0 and drop_pct >= 25.0):
+                severity = "P0" if (drop_pct >= crit_pct or curr_clicks == 0) else "P1"
+                pos_note = (
+                    f"\n• 均位变化: {base_pos:.1f} → {curr_pos:.1f} (下降 {pos_jump:.1f} 位)"
+                    if pos_jump >= 3.0 else ""
+                )
+                alerts.append(Alert(
+                    key=f"gsc_traffic:page:{path}",
+                    probe="gsc_traffic",
+                    severity=severity,
+                    title=f"核心页流量下跌 {drop_pct:.0f}%: {path}",
+                    detail=(
+                        f"日期 {eval_t2.isoformat()} 点击 {int(curr_clicks):,} vs 同星期基线 {int(base_p_clicks):,}{pos_note}"
+                    ),
+                    url=page_url,
+                    signature=f"{eval_t2.isoformat()}:{severity}",
+                ))
 
     return alerts
 
@@ -1047,6 +1116,8 @@ def check_gsc_traffic(
         },
     ).execute()
 
+    site_incomplete = _parse_iso_date((site_resp.get("metadata") or {}).get("firstIncompleteDate"))
+
     daily_totals: dict[date, dict[str, float]] = {}
     for row in site_resp.get("rows", []) or []:
         keys = row.get("keys") or []
@@ -1059,32 +1130,60 @@ def check_gsc_traffic(
             "position": float(row.get("position", 0) or 0),
         }
 
-    page_resp = gsc_service.searchanalytics().query(
-        siteUrl=property_url,
-        body={
-            "startDate": start_str,
-            "endDate": end_str,
-            "dimensions": ["date", "page"],
-            "rowLimit": 25000,
-            "dataState": "all",
-        },
-    ).execute()
-
     daily_by_page: dict[str, dict[date, dict[str, float]]] = {}
-    for row in page_resp.get("rows", []) or []:
-        keys = row.get("keys") or []
-        if len(keys) < 2:
-            continue
-        d = datetime.strptime(keys[0], "%Y-%m-%d").date()
-        norm_url = normalize_target_url(str(keys[1]), domain)
-        if not norm_url:
-            continue
-        bucket = daily_by_page.setdefault(norm_url, {})
-        bucket[d] = {
-            "clicks": float(row.get("clicks", 0) or 0),
-            "impressions": float(row.get("impressions", 0) or 0),
-            "position": float(row.get("position", 0) or 0),
-        }
+    page_incomplete: date | None = None
+    for page_idx in range(GSC_MAX_PAGE_PAGES):
+        page_resp = gsc_service.searchanalytics().query(
+            siteUrl=property_url,
+            body={
+                "startDate": start_str,
+                "endDate": end_str,
+                "dimensions": ["date", "page"],
+                "rowLimit": GSC_PAGE_ROW_LIMIT,
+                "startRow": page_idx * GSC_PAGE_ROW_LIMIT,
+                "dataState": "all",
+            },
+        ).execute()
+        if page_idx == 0:
+            page_incomplete = _parse_iso_date(
+                (page_resp.get("metadata") or {}).get("firstIncompleteDate")
+            )
+        rows = page_resp.get("rows", []) or []
+        for row in rows:
+            keys = row.get("keys") or []
+            if len(keys) < 2:
+                continue
+            d = datetime.strptime(keys[0], "%Y-%m-%d").date()
+            norm_url = normalize_target_url(str(keys[1]), domain)
+            if not norm_url:
+                continue
+            clicks_val = float(row.get("clicks", 0) or 0)
+            imps_val = float(row.get("impressions", 0) or 0)
+            pos_val = float(row.get("position", 0) or 0)
+
+            bucket = daily_by_page.setdefault(norm_url, {})
+            existing = bucket.get(d)
+            if existing is None:
+                bucket[d] = {
+                    "clicks": clicks_val,
+                    "impressions": imps_val,
+                    "position": pos_val,
+                }
+            else:
+                tot_imps = existing["impressions"] + imps_val
+                existing["position"] = (
+                    (existing["position"] * existing["impressions"] + pos_val * imps_val) / tot_imps
+                    if tot_imps > 0
+                    else existing["position"]
+                )
+                existing["clicks"] += clicks_val
+                existing["impressions"] = tot_imps
+
+        if len(rows) < GSC_PAGE_ROW_LIMIT:
+            break
+
+    incomplete_dates = [d for d in (site_incomplete, page_incomplete) if d is not None]
+    first_incomplete_date = min(incomplete_dates) if incomplete_dates else None
 
     return evaluate_gsc_traffic_series(
         daily_totals=daily_totals,
@@ -1093,6 +1192,7 @@ def check_gsc_traffic(
         now_utc=now_utc,
         warn_pct=warn_pct,
         crit_pct=crit_pct,
+        first_incomplete_date=first_incomplete_date,
     )
 
 

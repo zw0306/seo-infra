@@ -281,6 +281,159 @@ class TestGscAndGa4Evaluation(unittest.TestCase):
         self.assertEqual(late_alerts[0].key, "ga4:organic_drop")
         self.assertEqual(late_alerts[0].severity, "P0")
 
+    def test_gsc_incomplete_date_and_bypage_lag_suppress_false_zeros(self) -> None:
+        now_utc = datetime(2026, 11, 18, 1, 20, tzinfo=timezone.utc)
+        t2 = date(2026, 11, 16)
+        t1 = date(2026, 11, 17)
+
+        daily_totals = {}
+        home_series = {}
+        for d_off in range(34, 0, -1):
+            d = now_utc.date() - timedelta(days=d_off)
+            daily_totals[d] = {"clicks": 750.0, "impressions": 16000.0, "position": 6.3}
+            home_series[d] = {"clicks": 150.0, "impressions": 4000.0, "position": 6.1}
+
+        # Simulate incomplete T-2 byPage rollup + partial T-1 early UTC release
+        home_series_lagged = dict(home_series)
+        home_series_lagged.pop(t2, None)
+        daily_totals[t1] = {"clicks": 10.0, "impressions": 200.0, "position": 6.5}
+
+        # 1. With firstIncompleteDate == 2026-11-16, falls back to complete T-3 (2026-11-15) -> 0 false alerts
+        # Also at 01:20 UTC (< 10:00 UTC), partial T-1 does NOT false alarm!
+        alerts_incomplete = mon.evaluate_gsc_traffic_series(
+            daily_totals=daily_totals,
+            daily_by_page={"https://vpsheet.com/": home_series_lagged},
+            domain="vpsheet.com",
+            now_utc=now_utc,
+            first_incomplete_date=t2,
+        )
+        self.assertEqual(alerts_incomplete, [])
+
+        # 2. Even if firstIncompleteDate is already 2026-11-17, empty byPage on T-2 while site=750 skips page alert
+        alerts_bypage_lag = mon.evaluate_gsc_traffic_series(
+            daily_totals=daily_totals,
+            daily_by_page={"https://vpsheet.com/": home_series_lagged},
+            domain="vpsheet.com",
+            now_utc=now_utc,
+            first_incomplete_date=t1,
+        )
+        self.assertEqual(alerts_bypage_lag, [])
+
+        # 3. Real single-page drop when other pages cover site clicks DOES still alert P0!
+        other_page_series = {d: {"clicks": 600.0, "impressions": 12000.0, "position": 5.0} for d in daily_totals}
+        alerts_real_drop = mon.evaluate_gsc_traffic_series(
+            daily_totals=daily_totals,
+            daily_by_page={
+                "https://vpsheet.com/": home_series_lagged,
+                "https://vpsheet.com/midi-to-roblox": other_page_series,
+            },
+            domain="vpsheet.com",
+            now_utc=now_utc,
+            first_incomplete_date=t1,
+        )
+        keys = {a.key: a for a in alerts_real_drop}
+        self.assertIn("gsc_traffic:page:/", keys)
+        self.assertEqual(keys["gsc_traffic:page:/"].severity, "P0")
+
+    def test_check_gsc_traffic_pagination_and_incomplete_metadata(self) -> None:
+        now_utc = datetime(2026, 11, 18, 2, 38, tzinfo=timezone.utc)
+        rows_dates = [
+            {"keys": [(now_utc.date() - timedelta(days=d_off)).isoformat()], "clicks": 750, "impressions": 15000, "position": 6.2}
+            for d_off in range(34, 0, -1)
+        ]
+        # Force two pages of byPage rows with small page limit
+        orig_limit = mon.GSC_PAGE_ROW_LIMIT
+        mon.GSC_PAGE_ROW_LIMIT = 2
+        try:
+            mock_gsc = MagicMock()
+            query_mock = mock_gsc.searchanalytics.return_value.query
+
+            def fake_execute(siteUrl, body):
+                res = MagicMock()
+                if body["dimensions"] == ["date"]:
+                    res.execute.return_value = {
+                        "rows": rows_dates,
+                        "metadata": {"firstIncompleteDate": "2026-11-16"},
+                    }
+                    return res
+                start_row = body.get("startRow", 0)
+                if start_row == 0:
+                    res.execute.return_value = {
+                        "rows": [
+                            {"keys": ["2026-11-15", "https://vpsheet.com/"], "clicks": 150, "impressions": 4000, "position": 6.0},
+                            {"keys": ["2026-11-15", "https://vpsheet.com/midi-to-roblox"], "clicks": 50, "impressions": 500, "position": 5.0},
+                        ],
+                        "metadata": {"firstIncompleteDate": "2026-11-16"},
+                    }
+                else:
+                    res.execute.return_value = {
+                        "rows": [
+                            {"keys": ["2026-11-15", "https://vpsheet.com/sheet/in-the-pool"], "clicks": 40, "impressions": 300, "position": 4.0},
+                        ],
+                    }
+                return res
+
+            query_mock.side_effect = fake_execute
+            alerts = mon.check_gsc_traffic(mock_gsc, "sc-domain:vpsheet.com", "vpsheet.com", now_utc)
+            self.assertEqual(alerts, [])
+            # Verify pagination called startRow=0 and startRow=2 for ["date", "page"]
+            page_calls = [
+                call.kwargs["body"].get("startRow")
+                for call in query_mock.call_args_list
+                if call.kwargs["body"]["dimensions"] == ["date", "page"]
+            ]
+            self.assertEqual(page_calls, [0, 2])
+        finally:
+            mon.GSC_PAGE_ROW_LIMIT = orig_limit
+
+    def test_transient_soft_404_with_http_200_downgraded_then_escalates(self) -> None:
+        ir = {
+            "indexStatusResult": {
+                "verdict": "NEUTRAL",
+                "coverageState": "Soft 404",
+                "robotsTxtState": "ALLOWED",
+                "indexingState": "INDEXING_ALLOWED",
+                "pageFetchState": "SUCCESSFUL",
+                "lastCrawlTime": "2026-11-17T12:25:43Z",
+                "googleCanonical": "https://vpsheet.com/sheet/mrs-magic",
+            }
+        }
+        # Round 1 on non-homepage with healthy HTTP 200 -> P1 warning with diagnostic note
+        alerts1, cached1 = mon.evaluate_gsc_inspection_result(
+            url="https://vpsheet.com/sheet/mrs-magic",
+            ir=ir,
+            domain="vpsheet.com",
+            prev_verdict_info={"verdict": "PASS"},
+            known_traffic_clicks=45.0,
+            http_status=200,
+        )
+        self.assertEqual(len(alerts1), 1)
+        self.assertEqual(alerts1[0].severity, "P1")
+        self.assertIn("实时 HTTP 自检返回 200 正常", alerts1[0].detail)
+
+        # Round 2 still NEUTRAL -> escalates to P0!
+        alerts2, _ = mon.evaluate_gsc_inspection_result(
+            url="https://vpsheet.com/sheet/mrs-magic",
+            ir=ir,
+            domain="vpsheet.com",
+            prev_verdict_info=cached1,
+            known_traffic_clicks=45.0,
+            http_status=200,
+        )
+        self.assertEqual(len(alerts2), 1)
+        self.assertEqual(alerts2[0].severity, "P0")
+
+        # Homepage NEUTRAL -> immediate P0
+        alerts_home, _ = mon.evaluate_gsc_inspection_result(
+            url="https://vpsheet.com/",
+            ir=ir,
+            domain="vpsheet.com",
+            prev_verdict_info={"verdict": "PASS"},
+            known_traffic_clicks=500.0,
+            http_status=200,
+        )
+        self.assertEqual(alerts_home[0].severity, "P0")
+
 
 class TestAlertReconcileAndTelegram(unittest.TestCase):
     def test_dedup_escalation_probe_guard_and_recovery(self) -> None:
