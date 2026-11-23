@@ -1,6 +1,8 @@
+import http.server
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -224,6 +226,101 @@ class TestSeoGate(unittest.TestCase):
             _, after_fix_findings = gate.scan_site(dist, dict(gate.DEFAULT_CONFIG))
             _, fixed_keys = gate.apply_baseline(after_fix_findings, baseline_file)
             self.assertIn("index_hygiene:sitemap_noindex:/oops/", fixed_keys)
+
+    def test_base_url_mode_for_nextjs_ssr_server(self) -> None:
+        routes: dict[str, tuple[int, str, str]] = {
+            "/sitemap.xml": (
+                200,
+                "application/xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                "<url><loc>https://nextgame.example/</loc></url>"
+                "<url><loc>https://nextgame.example/guides/rules/</loc></url>"
+                "<url><loc>https://nextgame.example/missing-route/</loc></url>"
+                "<url><loc>https://nextgame.example/old-mode/</loc></url>"
+                "</urlset>",
+            ),
+            "/": (
+                200,
+                "text/html; charset=utf-8",
+                f"""<!doctype html><html><head>
+                <title>NextGame: Play Free Online Puzzle</title>
+                <link rel="canonical" href="https://nextgame.example/">
+                </head><body><main>
+                <h1>NextGame</h1>
+                <input type="text">
+                <article><p>{_unique_words("nxhome", 450)}</p>
+                <a href="https://nextgame.example/guides/rules/">Rules Guide</a>
+                <a href="/old-mode/">Old Mode</a></article>
+                </main></body></html>""",
+            ),
+            "/guides/rules/": (
+                200,
+                "text/html; charset=utf-8",
+                f"""<!doctype html><html><head>
+                <title>NextGame Rules & Scoring Breakdown</title>
+                <link rel="canonical" href="https://nextgame.example/guides/rules/">
+                </head><body><main>
+                <h1>NextGame Rules</h1>
+                <article><p>{_unique_words("nxrules", 500)}</p>
+                <a href="/">Play NextGame</a></article>
+                </main></body></html>""",
+            ),
+            "/new-mode/": (
+                200,
+                "text/html; charset=utf-8",
+                f"""<!doctype html><html><head>
+                <title>NextGame New Mode</title>
+                <link rel="canonical" href="https://nextgame.example/new-mode/">
+                </head><body><main>
+                <h1>NextGame New Mode</h1>
+                <article><p>{_unique_words("nxnew", 450)}</p></article>
+                </main></body></html>""",
+            ),
+        }
+
+        class MockNextHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path == "/old-mode/":
+                    self.send_response(301)
+                    self.send_header("Location", "/new-mode/")
+                    self.end_headers()
+                    return
+                entry = routes.get(self.path)
+                if not entry:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                code, ctype, body = entry
+                data = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockNextHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{port}"
+            records, findings = gate.scan_live_site(base_url, dict(gate.DEFAULT_CONFIG))
+            self.assertEqual(len(records), 4)
+            keys = {f.key for f in findings}
+            self.assertIn("index_hygiene:http_error:/missing-route/", keys)
+            self.assertIn("index_hygiene:redirect:/old-mode/", keys)
+            # Clean homepage & rules page (canonical with prod domain matches path) should have zero errors
+            self.assertFalse(any(f.target in ("/", "/guides/rules/") for f in findings))
+            # CLI strict exits 1 due to /missing-route/ HTTP 404
+            self.assertEqual(gate.main(["--base-url", base_url, "--format", "json"]), 1)
+            self.assertEqual(gate.main(["--base-url", base_url, "--warn-only"]), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

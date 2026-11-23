@@ -3,14 +3,18 @@
 Pre-Release SEO Traffic-Light Gate for Tool & Game Websites (seo_gate.py)
 
 Zero external dependencies (Python 3 standard library only).
-Scans a built static output directory (e.g., dist/, out/, .output/public/) + sitemap*.xml
-and evaluates 5 deterministic SEO risk gates:
+Supports two target modes:
+  - --dist <dir>:       Static build output (Astro dist/, Next.js static export out/, etc.)
+  - --base-url <url>:   Live preview server or staging URL (Next.js SSR/App Router, OpenNext/vinext,
+                        TanStack Start, Cloudflare Preview, e.g. http://localhost:3000)
+
+Evaluates 5 deterministic SEO risk gates:
 
   1. page_budget           — Interactive tool/game page prose cap & pseudo-academic bloat; thin content check
   2. payload_bloat         — Oversized static HTML payload (>250 KB) & low text-to-HTML ratio
   3. template_overlap      — Pairwise 5-gram containment across sitemap pages (catches template farms/duplication)
   4. intent_cannibalization— Cross-type twin pages competing for the same head topic (e.g. /mode/ vs /modes/mode/)
-  5. index_hygiene         — Sitemap vs noindex/canonical/missing-file/duplicate-title/orphan checks
+  5. index_hygiene         — Sitemap vs HTTP 200/redirect/noindex/canonical/missing-file/duplicate-title/orphan checks
 
 Execution modes:
   - Default (--strict):    exit 1 if any RED finding exists
@@ -22,10 +26,13 @@ Execution modes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import html as html_lib
 import json
 import re
 import sys
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -33,7 +40,7 @@ from fnmatch import fnmatch
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +110,9 @@ class PageRecord:
     url: str
     file_path: str | None
     exists: bool = False
+    http_status: int | None = None
+    fetch_error: str = ""
+    redirected_to: str = ""
     html_bytes: int = 0
     title: str = ""
     h1: str = ""
@@ -496,8 +506,238 @@ def extract_topic_tokens(text: str, brand_tokens: set[str]) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Live HTTP / Preview Helpers (--base-url mode for Next.js SSR / Workers / etc.)
+# ---------------------------------------------------------------------------
+
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _build_http_opener(base_url: str, no_proxy: bool = False) -> urllib.request.OpenerDirector:
+    host = (urlparse(base_url).hostname or "").lower()
+    if no_proxy or host in LOCAL_HOSTS:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
+
+def _rewrite_to_base_url(target_url: str, base_url: str) -> str:
+    base = base_url.rstrip("/")
+    parsed = urlparse(target_url)
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{base}{path}{query}"
+
+
+def _fetch_url(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    timeout: float = 15.0,
+) -> tuple[int | None, str, bytes, str]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "toolsite-seo-gate/1.0 (+https://github.com/zw0306/seo-infra)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            final_url = resp.geturl()
+            body = resp.read()
+            return status, final_url, body, ""
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, getattr(e, "url", url) or url, body, f"HTTP {e.code}"
+    except Exception as e:
+        return None, url, b"", str(e)
+
+
+def discover_remote_sitemap_urls(
+    base_url: str,
+    opener: urllib.request.OpenerDirector,
+    explicit_sitemap: str | None = None,
+    timeout: float = 15.0,
+) -> list[str]:
+    base = base_url.rstrip("/")
+    candidates: list[str] = []
+    if explicit_sitemap:
+        if explicit_sitemap.startswith(("http://", "https://")):
+            candidates.append(explicit_sitemap)
+        else:
+            candidates.append(urljoin(base + "/", explicit_sitemap.lstrip("/")))
+    else:
+        candidates.extend(
+            [
+                f"{base}/sitemap.xml",
+                f"{base}/sitemap-index.xml",
+                f"{base}/sitemap-0.xml",
+            ]
+        )
+
+    urls: list[str] = []
+    visited: set[str] = set()
+
+    def parse_remote_xml(xml_url: str) -> bool:
+        fetch_target = _rewrite_to_base_url(xml_url, base) if not explicit_sitemap else xml_url
+        if fetch_target in visited:
+            return False
+        visited.add(fetch_target)
+        status, _, body, _ = _fetch_url(opener, fetch_target, timeout=timeout)
+        if status != 200 or not body:
+            return False
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            return False
+        tag_local = root.tag.split("}")[-1].lower()
+        if tag_local == "sitemapindex":
+            found_any = False
+            for loc in root.iter():
+                if loc.tag.split("}")[-1].lower() == "loc" and loc.text:
+                    sub_fetch = _rewrite_to_base_url(loc.text.strip(), base)
+                    if parse_remote_xml(sub_fetch):
+                        found_any = True
+            return found_any
+        if tag_local == "urlset":
+            for loc in root.iter():
+                if loc.tag.split("}")[-1].lower() == "loc" and loc.text:
+                    urls.append(loc.text.strip())
+            return bool(urls)
+        return False
+
+    for cand in candidates:
+        if parse_remote_xml(cand):
+            break
+
+    # Try robots.txt Sitemap directives if standard paths missed
+    if not urls and not explicit_sitemap:
+        status, _, body, _ = _fetch_url(opener, f"{base}/robots.txt", timeout=timeout)
+        if status == 200 and body:
+            for line in body.decode("utf-8", errors="replace").splitlines():
+                m = re.match(r"^\s*Sitemap:\s*(\S+)", line, re.I)
+                if m:
+                    parse_remote_xml(_rewrite_to_base_url(m.group(1).strip(), base))
+
+    # Fallback: if no sitemap exists, inspect homepage + 1-hop internal links
+    if not urls:
+        home_url = f"{base}/"
+        urls.append(home_url)
+        status, _, body, _ = _fetch_url(opener, home_url, timeout=timeout)
+        if status == 200 and body:
+            parser = StaticPageParser()
+            parser.feed(body.decode("utf-8", errors="replace"))
+            parser.close()
+            home_host = (urlparse(base).hostname or "").lower()
+            for href in sorted(parser.all_links):
+                p = _resolve_internal_href(href, {home_host})
+                if p and p != "/":
+                    urls.append(f"{base}{p}")
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return unique
+
+
+# ---------------------------------------------------------------------------
 # Core Scanner & 5 Gates
 # ---------------------------------------------------------------------------
+
+def _populate_record_from_html(
+    rec: PageRecord,
+    raw_bytes: bytes,
+    site_hosts: set[str],
+    cfg: dict[str, Any],
+) -> None:
+    rec.html_bytes = len(raw_bytes)
+    raw_html = raw_bytes.decode("utf-8", errors="replace")
+
+    parser = StaticPageParser()
+    parser.feed(raw_html)
+    parser.close()
+
+    rec.title = re.sub(r"\s+", " ", html_lib.unescape("".join(parser.title_chunks))).strip()
+    rec.h1 = re.sub(r"\s+", " ", html_lib.unescape("".join(parser.h1_chunks))).strip()
+    rec.headings = parser.headings
+    rec.canonical = parser.canonical
+    rec.robots = parser.robots
+    rec.noindex = "noindex" in parser.robots.lower()
+    rec.schema_types = extract_schema_types(parser.jsonld_blobs)
+    rec.has_interactive_widget = parser.has_interactive_in_main
+    rec.has_article_tag = parser.has_article
+
+    main_text = re.sub(
+        r"\s+", " ", "".join(parser.main_text_chunks if parser.has_main else parser.body_text_chunks)
+    ).strip()
+    article_text = re.sub(r"\s+", " ", "".join(parser.article_text_chunks)).strip()
+
+    main_word_list = tokenize_words(main_text)
+    article_word_list = tokenize_words(article_text)
+
+    rec.main_words = len(main_word_list)
+    rec.article_words = len(article_word_list)
+    rec.prose_words = rec.article_words if rec.has_article_tag and rec.article_words > 0 else rec.main_words
+    rec.main_text_bytes = len(main_text.encode("utf-8"))
+    rec.text_ratio = (rec.main_text_bytes / rec.html_bytes) if rec.html_bytes > 0 else 0.0
+
+    # Measure raw <details> byte footprint (catches hidden accordion DOM bloat like /answers/)
+    rec.details_bytes = sum(
+        len(m.group(0).encode("utf-8")) for m in re.finditer(r"<details\b[^>]*>.*?</details>", raw_html, re.S | re.I)
+    )
+
+    # Pseudo-academic markers in headings
+    headings_joined = " | ".join(rec.headings)
+    for label, pat in PSEUDO_ACADEMIC_PATTERNS:
+        if pat.search(headings_joined):
+            rec.pseudo_academic_hits.append(label)
+
+    # Normalize internal links
+    for raw_href in parser.main_links:
+        p_href = _resolve_internal_href(raw_href, site_hosts)
+        if p_href and p_href != rec.path:
+            rec.main_links.add(p_href)
+    for raw_href in parser.all_links:
+        p_href = _resolve_internal_href(raw_href, site_hosts)
+        if p_href and p_href != rec.path:
+            rec.all_links.add(p_href)
+
+    rec.page_type = classify_page_type(rec, cfg)
+    rec.five_grams = build_five_grams(main_word_list)
+
+
+def _evaluate_records(records: list[PageRecord], cfg: dict[str, Any]) -> list[Finding]:
+    # Compute inbound internal link counts
+    by_path = {r.path: r for r in records}
+    for src in records:
+        if not src.exists or src.noindex:
+            continue
+        for target_path in src.main_links:
+            if target_path in by_path:
+                by_path[target_path].inbound_main_links += 1
+        for target_path in src.all_links:
+            if target_path in by_path:
+                by_path[target_path].inbound_all_links += 1
+
+    findings: list[Finding] = []
+    findings.extend(_gate_page_budget(records, cfg))
+    findings.extend(_gate_payload_bloat(records, cfg))
+    findings.extend(_gate_template_overlap(records, cfg))
+    findings.extend(_gate_intent_cannibalization(records, cfg))
+    findings.extend(_gate_index_hygiene(records))
+
+    # Sort deterministically: RED first, then gate, then key
+    severity_rank = {"RED": 0, "YELLOW": 1}
+    findings.sort(key=lambda f: (severity_rank.get(f.severity, 9), f.gate, f.key))
+    return findings
+
 
 def scan_site(
     dist_dir: Path,
@@ -527,88 +767,70 @@ def scan_site(
             exists=html_file is not None,
         )
         if html_file:
-            raw_bytes = html_file.read_bytes()
-            rec.html_bytes = len(raw_bytes)
-            raw_html = raw_bytes.decode("utf-8", errors="replace")
-
-            parser = StaticPageParser()
-            parser.feed(raw_html)
-            parser.close()
-
-            rec.title = re.sub(r"\s+", " ", html_lib.unescape("".join(parser.title_chunks))).strip()
-            rec.h1 = re.sub(r"\s+", " ", html_lib.unescape("".join(parser.h1_chunks))).strip()
-            rec.headings = parser.headings
-            rec.canonical = parser.canonical
-            rec.robots = parser.robots
-            rec.noindex = "noindex" in parser.robots.lower()
-            rec.schema_types = extract_schema_types(parser.jsonld_blobs)
-            rec.has_interactive_widget = parser.has_interactive_in_main
-            rec.has_article_tag = parser.has_article
-
-            main_text = re.sub(
-                r"\s+", " ", "".join(parser.main_text_chunks if parser.has_main else parser.body_text_chunks)
-            ).strip()
-            article_text = re.sub(r"\s+", " ", "".join(parser.article_text_chunks)).strip()
-
-            main_word_list = tokenize_words(main_text)
-            article_word_list = tokenize_words(article_text)
-
-            rec.main_words = len(main_word_list)
-            rec.article_words = len(article_word_list)
-            rec.prose_words = rec.article_words if rec.has_article_tag and rec.article_words > 0 else rec.main_words
-            rec.main_text_bytes = len(main_text.encode("utf-8"))
-            rec.text_ratio = (rec.main_text_bytes / rec.html_bytes) if rec.html_bytes > 0 else 0.0
-
-            # Measure raw <details> byte footprint (catches hidden accordion DOM bloat like /answers/)
-            rec.details_bytes = sum(len(m.group(0).encode("utf-8")) for m in re.finditer(r"<details\b[^>]*>.*?</details>", raw_html, re.S | re.I))
-
-            # Pseudo-academic markers in headings
-            headings_joined = " | ".join(rec.headings)
-            for label, pat in PSEUDO_ACADEMIC_PATTERNS:
-                if pat.search(headings_joined):
-                    rec.pseudo_academic_hits.append(label)
-
-            # Normalize internal links
-            for raw_href in parser.main_links:
-                p_href = _resolve_internal_href(raw_href, site_hosts)
-                if p_href and p_href != rec.path:
-                    rec.main_links.add(p_href)
-            for raw_href in parser.all_links:
-                p_href = _resolve_internal_href(raw_href, site_hosts)
-                if p_href and p_href != rec.path:
-                    rec.all_links.add(p_href)
-
-            rec.page_type = classify_page_type(rec, cfg)
-            # Build 5-grams across <main> visible text (captures shared FAQ/CTA/template blocks too).
-            # If two tool pages share an identical interactive widget shell, only flag sibling clusters
-            # or genuine boilerplate (min_shared_5grams + containment filter).
-            rec.five_grams = build_five_grams(main_word_list)
-
+            _populate_record_from_html(rec, html_file.read_bytes(), site_hosts, cfg)
         records.append(rec)
 
-    # Compute inbound internal link counts
-    by_path = {r.path: r for r in records}
-    for src in records:
-        if not src.exists or src.noindex:
+    return records, _evaluate_records(records, cfg)
+
+
+def scan_live_site(
+    base_url: str,
+    cfg: dict[str, Any],
+    explicit_sitemap: str | None = None,
+    timeout: float = 15.0,
+    concurrency: int = 6,
+    max_pages: int = 300,
+    no_proxy: bool = False,
+) -> tuple[list[PageRecord], list[Finding]]:
+    opener = _build_http_opener(base_url, no_proxy=no_proxy)
+    sitemap_urls = discover_remote_sitemap_urls(
+        base_url, opener, explicit_sitemap=explicit_sitemap, timeout=timeout
+    )
+
+    ignore_patterns = cfg.get("ignore_paths", [])
+    site_hosts: set[str] = set()
+    base_host = urlparse(base_url).hostname
+    if base_host:
+        site_hosts.add(base_host.lower())
+    for u in sitemap_urls:
+        h = urlparse(u).hostname
+        if h:
+            site_hosts.add(h.lower())
+
+    filtered_urls: list[tuple[str, str]] = []
+    for u in sitemap_urls:
+        path = normalize_path(u)
+        if matches_any_pattern(path, ignore_patterns):
             continue
-        for target_path in src.main_links:
-            if target_path in by_path:
-                by_path[target_path].inbound_main_links += 1
-        for target_path in src.all_links:
-            if target_path in by_path:
-                by_path[target_path].inbound_all_links += 1
+        filtered_urls.append((u, path))
+        if max_pages > 0 and len(filtered_urls) >= max_pages:
+            break
 
-    findings: list[Finding] = []
-    findings.extend(_gate_page_budget(records, cfg))
-    findings.extend(_gate_payload_bloat(records, cfg))
-    findings.extend(_gate_template_overlap(records, cfg))
-    findings.extend(_gate_intent_cannibalization(records, cfg))
-    findings.extend(_gate_index_hygiene(records))
+    def fetch_one(item: tuple[str, str]) -> PageRecord:
+        orig_url, path = item
+        fetch_target = _rewrite_to_base_url(orig_url, base_url)
+        status, final_url, body, err = _fetch_url(opener, fetch_target, timeout=timeout)
+        rec = PageRecord(
+            path=path,
+            url=orig_url,
+            file_path=fetch_target,
+            exists=(status == 200 and bool(body)),
+            http_status=status,
+            fetch_error=err,
+        )
+        if status == 200 and final_url:
+            final_path = normalize_path(final_url)
+            if final_path != path:
+                rec.redirected_to = final_path
+        if rec.exists:
+            _populate_record_from_html(rec, body, site_hosts, cfg)
+        return rec
 
-    # Sort deterministically: RED first, then gate, then key
-    severity_rank = {"RED": 0, "YELLOW": 1}
-    findings.sort(key=lambda f: (severity_rank.get(f.severity, 9), f.gate, f.key))
-    return records, findings
+    workers = max(1, min(int(concurrency), 16))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        records = list(pool.map(fetch_one, filtered_urls))
+
+    return records, _evaluate_records(records, cfg)
 
 
 def _resolve_internal_href(href: str, site_hosts: set[str]) -> str | None:
@@ -945,16 +1167,41 @@ def _gate_index_hygiene(records: list[PageRecord]) -> list[Finding]:
 
     for r in records:
         if not r.exists:
+            if r.http_status is not None or r.fetch_error:
+                reason = f"HTTP {r.http_status}" if r.http_status is not None else r.fetch_error
+                findings.append(
+                    Finding(
+                        gate="index_hygiene",
+                        severity="RED",
+                        key=f"index_hygiene:http_error:{r.path}",
+                        target=r.path,
+                        message=f"Sitemap URL failed live fetch ({reason}) at {r.file_path or r.url}.",
+                        metric={"http_status": r.http_status, "error": r.fetch_error},
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        gate="index_hygiene",
+                        severity="RED",
+                        key=f"index_hygiene:missing:{r.path}",
+                        target=r.path,
+                        message=f"URL listed in sitemap has no built HTML file in dist/ ({r.url}).",
+                    )
+                )
+            continue
+
+        if r.redirected_to:
             findings.append(
                 Finding(
                     gate="index_hygiene",
-                    severity="RED",
-                    key=f"index_hygiene:missing:{r.path}",
+                    severity="YELLOW",
+                    key=f"index_hygiene:redirect:{r.path}",
                     target=r.path,
-                    message=f"URL listed in sitemap has no built HTML file in dist/ ({r.url}).",
+                    message=f"Sitemap URL redirected to a different path ({r.path} -> {r.redirected_to}).",
+                    metric={"redirected_to": r.redirected_to},
                 )
             )
-            continue
 
         if r.noindex:
             findings.append(
@@ -1095,7 +1342,7 @@ def gate_status_summary(findings: list[Finding]) -> dict[str, str]:
 
 
 def format_markdown(
-    dist_dir: Path,
+    target_label: str,
     records: list[PageRecord],
     findings: list[Finding],
     fixed_keys: list[str],
@@ -1120,7 +1367,7 @@ def format_markdown(
     baselined_list = [f for f in findings if f.baselined]
 
     lines: list[str] = [
-        f"# Tool/Game Site SEO Pre-Release Gate (`{dist_dir}`)",
+        f"# Tool/Game Site SEO Pre-Release Gate (`{target_label}`)",
         "",
         f"- **Mode**: `{mode}` | **Sitemap URLs**: `{len(records)}` "
         f"(tool: {type_counts['tool']}, content: {type_counts['content']}, hub: {type_counts['hub']}, legal: {type_counts['legal']})",
@@ -1173,23 +1420,52 @@ def load_config(config_path: Path | None, tool_paths: list[str]) -> dict[str, An
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="5-gate pre-release SEO traffic-light scanner for tool & game sites.")
-    ap.add_argument("--dist", type=Path, required=True, help="Path to built static directory (e.g. ./dist)")
-    ap.add_argument("--sitemap", type=Path, default=None, help="Optional explicit sitemap XML path")
+    ap = argparse.ArgumentParser(
+        description="5-gate pre-release SEO traffic-light scanner for tool & game sites (static dist/ or live --base-url)."
+    )
+    src_group = ap.add_mutually_exclusive_group(required=True)
+    src_group.add_argument("--dist", type=Path, help="Path to built static directory (e.g. ./dist or Next.js ./out)")
+    src_group.add_argument("--base-url", type=str, help="Live/preview base URL (e.g. http://localhost:3000 for Next.js SSR)")
+    ap.add_argument("--sitemap", type=str, default=None, help="Optional explicit sitemap file path (--dist) or path/URL (--base-url)")
     ap.add_argument("--config", type=Path, default=None, help="Optional JSON config overriding thresholds/tool_paths")
     ap.add_argument("--tool-path", action="append", default=[], help="Explicit glob/path treated as interactive tool page")
+    ap.add_argument("--timeout", type=float, default=15.0, help="Per-request HTTP timeout in seconds (--base-url mode)")
+    ap.add_argument("--concurrency", type=int, default=6, help="Max concurrent HTTP fetches (--base-url mode, 1-16)")
+    ap.add_argument("--max-pages", type=int, default=300, help="Max sitemap pages to fetch in --base-url mode (0 = unlimited)")
+    ap.add_argument("--no-proxy", action="store_true", help="Bypass HTTP/HTTPS proxy env vars in --base-url mode (auto-enabled for localhost)")
     ap.add_argument("--warn-only", action="store_true", help="Always exit 0 (report only)")
     ap.add_argument("--baseline", type=Path, default=None, help="Ratchet baseline JSON (only NEW RED findings exit 1)")
     ap.add_argument("--write-baseline", type=Path, default=None, help="Write current finding keys to baseline JSON")
     ap.add_argument("--format", choices=("markdown", "json"), default="markdown", help="Output format")
     args = ap.parse_args(argv)
 
-    if not args.dist.is_dir():
-        print(f"ERROR: dist directory not found: {args.dist}", file=sys.stderr)
-        return 2
-
     cfg = load_config(args.config, args.tool_path)
-    records, findings = scan_site(args.dist, cfg, explicit_sitemap=args.sitemap)
+
+    if args.dist is not None:
+        if not args.dist.is_dir():
+            print(f"ERROR: dist directory not found: {args.dist}", file=sys.stderr)
+            return 2
+        target_label = str(args.dist)
+        records, findings = scan_site(
+            args.dist,
+            cfg,
+            explicit_sitemap=Path(args.sitemap) if args.sitemap else None,
+        )
+    else:
+        base_url = args.base_url.strip().rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            print(f"ERROR: --base-url must start with http:// or https://: {base_url}", file=sys.stderr)
+            return 2
+        target_label = base_url
+        records, findings = scan_live_site(
+            base_url,
+            cfg,
+            explicit_sitemap=args.sitemap,
+            timeout=args.timeout,
+            concurrency=args.concurrency,
+            max_pages=args.max_pages,
+            no_proxy=args.no_proxy,
+        )
 
     fixed_keys: list[str] = []
     if args.write_baseline:
@@ -1203,7 +1479,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.format == "json":
         output = {
-            "dist": str(args.dist),
+            "target": target_label,
+            "dist": str(args.dist) if args.dist is not None else None,
+            "base_url": target_label if args.base_url else None,
             "mode": mode,
             "page_count": len(records),
             "gate_status": gate_status_summary(findings),
@@ -1215,7 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
     else:
-        print(format_markdown(args.dist, records, findings, fixed_keys, mode))
+        print(format_markdown(target_label, records, findings, fixed_keys, mode))
 
     if args.warn_only:
         return 0
