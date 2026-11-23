@@ -9,6 +9,7 @@ SEO 报表基础设施仓库，集中管理所有项目通用的 SEO 周报自�
   seo-report-core.yml       # Google SEO 周报（Reusable Workflow）
   seo-monitor-core.yml      # SEO 异常健康监控与告警（Reusable Workflow）
 scripts/
+  seo_gate.py                 # 上线前 5 项 SEO 红绿灯静态门禁（零依赖，支持 --strict / --warn-only / --baseline）
   seo_health_monitor.py       # HTTP / GSC 抓取收录 / Sitemap / GSC+GA4 流量异动监控
   seo_weekly_summary.py       # Telegram 极简摘要生成
   generate_weekly_markdown.py # 语义聚类深度周报生成（支持 CTR 异常词分析 + 趋势 Section）
@@ -16,6 +17,7 @@ scripts/
   fetch_bing.py               # Bing Webmaster Tools 数据拉取
   report_bing.py              # Bing SEO 月报生成（含 GSC 双引擎对比）
 tests/
+  test_seo_gate.py            # 上线前 SEO 红绿灯门禁单元测试
   test_seo_health_monitor.py  # 监控脚本单元测试
 ```
 

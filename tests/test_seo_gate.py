@@ -1,0 +1,230 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import seo_gate as gate
+
+
+def _write_page(dist: Path, rel_path: str, html_body: str) -> None:
+    target = dist / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(html_body, encoding="utf-8")
+
+
+def _write_sitemap(dist: Path, urls: list[str]) -> None:
+    locs = "".join(f"<url><loc>{u}</loc></url>" for u in urls)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{locs}</urlset>"
+    )
+    (dist / "sitemap-0.xml").write_text(xml, encoding="utf-8")
+
+
+def _unique_words(prefix: str, count: int) -> str:
+    return " ".join(f"{prefix}w{i}" for i in range(count))
+
+
+class TestSeoGate(unittest.TestCase):
+    def test_clean_tool_and_guide_site_passes_all_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            _write_page(
+                dist,
+                "index.html",
+                f"""<!doctype html><html><head>
+                <title>NovaGame: Play Free Daily Word Puzzle</title>
+                <link rel="canonical" href="https://novagame.test/">
+                </head><body><main>
+                <h1>NovaGame</h1>
+                <input type="text" placeholder="Type guess">
+                <article><p>{_unique_words("home", 450)}</p>
+                <a href="/guides/scoring/">Scoring Guide</a></article>
+                </main></body></html>""",
+            )
+            _write_page(
+                dist,
+                "guides/scoring/index.html",
+                f"""<!doctype html><html><head>
+                <title>NovaGame Scoring Rules & Depth Chart</title>
+                <link rel="canonical" href="https://novagame.test/guides/scoring/">
+                </head><body><main>
+                <h1>NovaGame Scoring Rules</h1>
+                <article><p>{_unique_words("score", 600)}</p>
+                <a href="/">Play NovaGame</a></article>
+                </main></body></html>""",
+            )
+            _write_sitemap(dist, ["https://novagame.test/", "https://novagame.test/guides/scoring/"])
+
+            rc = gate.main(["--dist", str(dist), "--format", "json"])
+            self.assertEqual(rc, 0)
+
+    def test_catches_all_five_gate_violations_and_ratchet_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            shared_boilerplate = _unique_words("shared", 200)
+
+            # 1. Homepage (links to pages so they aren't orphans)
+            _write_page(
+                dist,
+                "index.html",
+                f"""<!doctype html><html><head>
+                <title>DemoGame Home</title>
+                <link rel="canonical" href="https://demo.test/">
+                </head><body><main>
+                <h1>DemoGame</h1>
+                <input type="text">
+                <article><p>{_unique_words("root", 450)}</p>
+                <a href="/blitz/">Blitz</a>
+                <a href="/modes/blitz-mode/">Blitz Guide</a>
+                <a href="/heavy/">Heavy</a>
+                <a href="/packs/alpha/">Alpha</a>
+                <a href="/packs/beta/">Beta</a>
+                </article></main></body></html>""",
+            )
+
+            # 2. Overlong + pseudo-academic tool page + twin cannibalization with /modes/blitz-mode/
+            _write_page(
+                dist,
+                "blitz/index.html",
+                f"""<!doctype html><html><head>
+                <title>Play DemoGame Blitz Online</title>
+                <link rel="canonical" href="https://demo.test/blitz/">
+                </head><body><main>
+                <h1>DemoGame Blitz</h1>
+                <canvas id="board"></canvas>
+                <article>
+                  <h2>Peer-Reviewed Academic References</h2>
+                  <p>{_unique_words("blitztool", 2150)}</p>
+                </article></main></body></html>""",
+            )
+            _write_page(
+                dist,
+                "modes/blitz-mode/index.html",
+                f"""<!doctype html><html><head>
+                <title>DemoGame Blitz Mode Guide & Rules</title>
+                <link rel="canonical" href="https://demo.test/modes/blitz-mode/">
+                </head><body><main>
+                <h1>DemoGame Blitz Mode Guide</h1>
+                <article><p>{_unique_words("blitzguide", 600)}</p></article>
+                </main></body></html>""",
+            )
+
+            # 3. Oversized HTML payload (>250 KB)
+            huge_details = "<details>" + ("<span>item</span>" * 20000) + "</details>"
+            _write_page(
+                dist,
+                "heavy/index.html",
+                f"""<!doctype html><html><head>
+                <title>Heavy Payload Answers</title>
+                <link rel="canonical" href="https://demo.test/heavy/">
+                </head><body><main>
+                <h1>Heavy Answers</h1>
+                {huge_details}
+                <article><p>{_unique_words("heavy", 500)}</p></article>
+                </main></body></html>""",
+            )
+
+            # 4. Template overlap cluster under /packs/*
+            for name in ("alpha", "beta"):
+                _write_page(
+                    dist,
+                    f"packs/{name}/index.html",
+                    f"""<!doctype html><html><head>
+                    <title>DemoGame {name.title()} Pack</title>
+                    <link rel="canonical" href="https://demo.test/packs/{name}/">
+                    </head><body><main>
+                    <h1>{name.title()} Pack</h1>
+                    <input type="text">
+                    <article><p>{shared_boilerplate} {_unique_words(name, 160)}</p></article>
+                    </main></body></html>""",
+                )
+
+            # 5. Contradictory sitemap + noindex page
+            _write_page(
+                dist,
+                "oops/index.html",
+                """<!doctype html><html><head>
+                <title>Oops Noindex Page</title>
+                <meta name="robots" content="noindex, nofollow">
+                <link rel="canonical" href="https://demo.test/oops/">
+                </head><body><main><h1>Oops</h1></main></body></html>""",
+            )
+
+            _write_sitemap(
+                dist,
+                [
+                    "https://demo.test/",
+                    "https://demo.test/blitz/",
+                    "https://demo.test/modes/blitz-mode/",
+                    "https://demo.test/heavy/",
+                    "https://demo.test/packs/alpha/",
+                    "https://demo.test/packs/beta/",
+                    "https://demo.test/oops/",
+                ],
+            )
+
+            records, findings = gate.scan_site(dist, dict(gate.DEFAULT_CONFIG))
+            self.assertEqual(len(records), 7)
+
+            red_gates = {f.gate for f in findings if f.severity == "RED"}
+            self.assertEqual(
+                red_gates,
+                {"page_budget", "payload_bloat", "template_overlap", "intent_cannibalization", "index_hygiene"},
+            )
+
+            # Strict fails (exit 1), warn-only succeeds (exit 0)
+            self.assertEqual(gate.main(["--dist", str(dist)]), 1)
+            self.assertEqual(gate.main(["--dist", str(dist), "--warn-only"]), 0)
+
+            # Write baseline -> ratchet mode now exits 0 with zero NEW RED findings
+            baseline_file = dist / "seo-gate-baseline.json"
+            gate.write_baseline(findings, baseline_file)
+            self.assertEqual(gate.main(["--dist", str(dist), "--baseline", str(baseline_file)]), 0)
+
+            # Introduce a brand-new RED violation -> ratchet mode catches it and exits 1
+            _write_page(
+                dist,
+                "broken/index.html",
+                """<!doctype html><html><head><title></title></head><body><main></main></body></html>""",
+            )
+            _write_sitemap(
+                dist,
+                [
+                    "https://demo.test/",
+                    "https://demo.test/blitz/",
+                    "https://demo.test/modes/blitz-mode/",
+                    "https://demo.test/heavy/",
+                    "https://demo.test/packs/alpha/",
+                    "https://demo.test/packs/beta/",
+                    "https://demo.test/oops/",
+                    "https://demo.test/broken/",
+                ],
+            )
+            self.assertEqual(gate.main(["--dist", str(dist), "--baseline", str(baseline_file)]), 1)
+
+            # Verify fixed baseline detection when /oops/ is removed from sitemap
+            _write_sitemap(
+                dist,
+                [
+                    "https://demo.test/",
+                    "https://demo.test/blitz/",
+                    "https://demo.test/modes/blitz-mode/",
+                    "https://demo.test/heavy/",
+                    "https://demo.test/packs/alpha/",
+                    "https://demo.test/packs/beta/",
+                ],
+            )
+            _, after_fix_findings = gate.scan_site(dist, dict(gate.DEFAULT_CONFIG))
+            _, fixed_keys = gate.apply_baseline(after_fix_findings, baseline_file)
+            self.assertIn("index_hygiene:sitemap_noindex:/oops/", fixed_keys)
+
+
+if __name__ == "__main__":
+    unittest.main()
