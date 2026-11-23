@@ -47,6 +47,7 @@ MAX_TELEGRAM_CHARS = 3800
 GSC_PAGE_ROW_LIMIT = 25000
 GSC_MAX_PAGE_PAGES = 4
 MIN_BYPAGE_COVERAGE_RATIO = 0.2
+UNVERIFIED_ALERT_TTL_DAYS = 14
 
 CRITICAL_FETCH_STATES = {
     "ACCESS_FORBIDDEN",
@@ -952,6 +953,14 @@ def _resolve_complete_t2_date(
     return None
 
 
+def _format_change_pct(drop_pct: float) -> str:
+    """Format drop_pct = (base - curr) / base * 100 as signed delta from baseline."""
+    delta = round(-drop_pct, 1)
+    if delta == 0.0:
+        return "0.0%"
+    return f"{delta:+.1f}%"
+
+
 def evaluate_gsc_traffic_series(
     daily_totals: dict[date, dict[str, float]],
     daily_by_page: dict[str, dict[date, dict[str, float]]],
@@ -963,6 +972,7 @@ def evaluate_gsc_traffic_series(
     min_site_impressions: float = 200.0,
     min_page_clicks: float = 40.0,
     first_incomplete_date: date | None = None,
+    evaluated_keys: set[str] | None = None,
 ) -> list[Alert]:
     """Analyze GSC daily totals and top pages for sudden complete-day drops or T-1 collapse."""
     alerts: list[Alert] = []
@@ -983,14 +993,19 @@ def evaluate_gsc_traffic_series(
         base_clicks, base_label = compute_same_weekday_baseline(click_series, eval_t2)
         base_imps, _ = compute_same_weekday_baseline(imp_series, eval_t2)
 
+        clicks_eligible = base_clicks is not None and base_clicks >= min_site_clicks
+        imps_eligible = base_imps is not None and base_imps >= min_site_impressions
+        if evaluated_keys is not None and (clicks_eligible or imps_eligible):
+            evaluated_keys.add("gsc_traffic:site_t2_drop")
+
         click_drop = (
             ((base_clicks - t2_clicks) / base_clicks * 100.0)
-            if (base_clicks is not None and base_clicks >= min_site_clicks)
+            if clicks_eligible
             else 0.0
         )
         imp_drop = (
             ((base_imps - t2_imps) / base_imps * 100.0)
-            if (base_imps is not None and base_imps >= min_site_impressions)
+            if imps_eligible
             else 0.0
         )
         worst_drop = max(click_drop, imp_drop)
@@ -1003,8 +1018,8 @@ def evaluate_gsc_traffic_series(
                 title=f"GSC 全站搜索流量暴跌 ({eval_t2.isoformat()})",
                 detail=(
                     f"基线口径: {base_label}\n"
-                    f"• 点击: {int(t2_clicks):,} vs 基线 {int(base_clicks or 0):,} (-{click_drop:.1f}%)\n"
-                    f"• 曝光: {int(t2_imps):,} vs 基线 {int(base_imps or 0):,} (-{imp_drop:.1f}%)"
+                    f"• 点击: {int(t2_clicks):,} vs 基线 {int(base_clicks or 0):,} ({_format_change_pct(click_drop)})\n"
+                    f"• 曝光: {int(t2_imps):,} vs 基线 {int(base_imps or 0):,} ({_format_change_pct(imp_drop)})"
                 ),
                 url=f"https://{domain}/",
                 signature=f"{eval_t2.isoformat()}:{severity}",
@@ -1013,6 +1028,8 @@ def evaluate_gsc_traffic_series(
     # 2. Severe T-1 collapse guard (requires >= 10:00 UTC so early-morning partial release doesn't false-alarm)
     t1_base_clicks, t1_label = compute_same_weekday_baseline(click_series, t1_date)
     if now_utc.hour >= 10 and t1_base_clicks is not None and t1_base_clicks >= 100.0:
+        if evaluated_keys is not None:
+            evaluated_keys.add("gsc_traffic:site_t1_collapse")
         t1_clicks = click_series.get(t1_date, 0.0)
         if (t1_date in daily_totals and t1_clicks <= t1_base_clicks * 0.05) or (
             t1_date not in daily_totals and now_utc.hour >= 14
@@ -1054,6 +1071,10 @@ def evaluate_gsc_traffic_series(
             if base_p_clicks is None or base_p_clicks < min_page_clicks:
                 continue
 
+            path = short_path(page_url, domain)
+            if evaluated_keys is not None:
+                evaluated_keys.add(f"gsc_traffic:page:{path}")
+
             curr_clicks = p_clicks.get(eval_t2, 0.0)
             drop_pct = (base_p_clicks - curr_clicks) / base_p_clicks * 100.0
 
@@ -1070,7 +1091,6 @@ def evaluate_gsc_traffic_series(
             if base_pos > 0 and curr_pos > 0 and (base_p_imps or 0) >= 100:
                 pos_jump = curr_pos - base_pos
 
-            path = short_path(page_url, domain)
             if drop_pct >= warn_pct or (pos_jump >= 5.0 and drop_pct >= 25.0):
                 severity = "P0" if (drop_pct >= crit_pct or curr_clicks == 0) else "P1"
                 pos_note = (
@@ -1099,6 +1119,7 @@ def check_gsc_traffic(
     now_utc: datetime,
     warn_pct: float = 40.0,
     crit_pct: float = 60.0,
+    evaluated_keys: set[str] | None = None,
 ) -> list[Alert]:
     """Query GSC daily site & page series (dataState=all) and detect drops."""
     today_utc = now_utc.date()
@@ -1193,6 +1214,7 @@ def check_gsc_traffic(
         warn_pct=warn_pct,
         crit_pct=crit_pct,
         first_incomplete_date=first_incomplete_date,
+        evaluated_keys=evaluated_keys,
     )
 
 
@@ -1203,6 +1225,7 @@ def evaluate_ga4_daily_sessions(
     warn_pct: float = 40.0,
     crit_pct: float = 60.0,
     min_sessions: float = 20.0,
+    evaluated_keys: set[str] | None = None,
 ) -> list[Alert]:
     """
     Evaluate GA4 daily organic sessions against same-weekday baseline.
@@ -1221,6 +1244,8 @@ def evaluate_ga4_daily_sessions(
         base_sessions, base_label = compute_same_weekday_baseline(daily_sessions, target_d)
         if base_sessions is None or base_sessions < min_sessions:
             continue
+        if evaluated_keys is not None:
+            evaluated_keys.add("ga4:organic_drop")
         curr = float(daily_sessions.get(target_d, 0.0))
         drop_pct = (base_sessions - curr) / base_sessions * 100.0
         if drop_pct >= warn_pct:
@@ -1232,7 +1257,7 @@ def evaluate_ga4_daily_sessions(
                 severity=severity,
                 title=f"GA4 自然流量异常下跌 {drop_pct:.0f}% ({label} {target_d.isoformat()})",
                 detail=(
-                    f"Organic Search 会话数: {int(curr):,} vs {base_label} 基线 {int(base_sessions):,} (-{drop_pct:.1f}%)"
+                    f"Organic Search 会话数: {int(curr):,} vs {base_label} 基线 {int(base_sessions):,} ({_format_change_pct(drop_pct)})"
                 ),
                 url=f"https://{domain}/",
                 signature=f"{target_d.isoformat()}:{severity}",
@@ -1249,6 +1274,7 @@ def check_ga4_traffic(
     now_utc: datetime,
     warn_pct: float = 40.0,
     crit_pct: float = 60.0,
+    evaluated_keys: set[str] | None = None,
 ) -> list[Alert]:
     """Query GA4 Data API v1beta daily organic sessions and detect anomalies."""
     from google.analytics.data_v1beta.types import (
@@ -1296,6 +1322,7 @@ def check_ga4_traffic(
         now_utc=now_utc,
         warn_pct=warn_pct,
         crit_pct=crit_pct,
+        evaluated_keys=evaluated_keys,
     )
 
 
@@ -1309,6 +1336,19 @@ def _parse_iso(ts: str) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _is_stale_unverified(old: dict[str, Any], now_utc: datetime, ttl_days: int) -> bool:
+    if ttl_days <= 0:
+        return False
+    ts_raw = old.get("last_notified") or old.get("first_seen")
+    if not ts_raw:
+        return False
+    try:
+        elapsed = (now_utc - _parse_iso(ts_raw)).total_seconds()
+    except ValueError:
+        return False
+    return elapsed >= ttl_days * 86400.0
+
+
 def reconcile_alerts(
     current_alerts: list[Alert],
     prev_state: dict[str, Any],
@@ -1316,6 +1356,8 @@ def reconcile_alerts(
     completed_probes: set[str],
     failed_inspect_urls: set[str],
     cooldown_hours: float = 24.0,
+    evaluated_probe_keys: dict[str, set[str]] | None = None,
+    unverified_ttl_days: int = UNVERIFIED_ALERT_TTL_DAYS,
 ) -> tuple[list[Alert], list[dict[str, Any]], dict[str, Any]]:
     """
     Compare current findings against active_alerts state.
@@ -1364,7 +1406,8 @@ def reconcile_alerts(
         entry["last_notified"] = last_notified_str
         new_active_map[key] = entry
 
-    # 2. Detect resolved alerts ONLY for probes/URLs that succeeded in this run
+    # 2. Detect resolved alerts ONLY for probes/URLs/keys actually verified in this run
+    probe_keys_map = evaluated_probe_keys or {}
     for key, old in prev_active.items():
         if key in curr_by_key:
             continue
@@ -1372,11 +1415,15 @@ def reconcile_alerts(
         url = old.get("url", "")
         probe_ok = probe in completed_probes
         url_inspect_failed = probe == "gsc_inspect" and url in failed_inspect_urls
+        key_unverified = probe in probe_keys_map and key not in probe_keys_map[probe]
 
-        if probe_ok and not url_inspect_failed:
+        if probe_ok and not url_inspect_failed and not key_unverified:
             resolved.append(old)
+        elif key_unverified and _is_stale_unverified(old, now_utc, unverified_ttl_days):
+            # Rolling baseline fell below threshold for >ttl_days; expire quietly without false recovery notice
+            continue
         else:
-            # Preserve unverified alert state until probe succeeds cleanly
+            # Preserve unverified alert state until probe/key check runs cleanly
             new_active_map[key] = old
 
     return to_notify, resolved, new_active_map
@@ -1611,9 +1658,12 @@ def run_monitor(args: argparse.Namespace) -> int:
                 f"GSC URL Inspection 有 {len(inspect_res['failed_urls'])} 个页面请求失败"
             )
 
+    evaluated_probe_keys: dict[str, set[str]] = {}
+
     # 5. GSC Traffic & Ranking Anomaly
     if gsc_service is not None:
         try:
+            gsc_eval_keys: set[str] = set()
             gsc_alerts = check_gsc_traffic(
                 gsc_service=gsc_service,
                 property_url=property_url,
@@ -1621,15 +1671,18 @@ def run_monitor(args: argparse.Namespace) -> int:
                 now_utc=now_utc,
                 warn_pct=args.warn_pct,
                 crit_pct=args.crit_pct,
+                evaluated_keys=gsc_eval_keys,
             )
             all_alerts.extend(gsc_alerts)
             completed_probes.add("gsc_traffic")
+            evaluated_probe_keys["gsc_traffic"] = gsc_eval_keys
         except Exception as exc:
             probe_errors.append(f"GSC 流量分析失败: {exc}")
 
     # 6. GA4 Organic Traffic Anomaly
     if ga4_client is not None and args.ga4_property:
         try:
+            ga4_eval_keys: set[str] = set()
             ga4_alerts = check_ga4_traffic(
                 ga4_client=ga4_client,
                 ga4_property_id=args.ga4_property,
@@ -1637,9 +1690,11 @@ def run_monitor(args: argparse.Namespace) -> int:
                 now_utc=now_utc,
                 warn_pct=args.warn_pct,
                 crit_pct=args.crit_pct,
+                evaluated_keys=ga4_eval_keys,
             )
             all_alerts.extend(ga4_alerts)
             completed_probes.add("ga4")
+            evaluated_probe_keys["ga4"] = ga4_eval_keys
         except Exception as exc:
             probe_errors.append(f"GA4 流量分析失败: {exc}")
 
@@ -1651,6 +1706,7 @@ def run_monitor(args: argparse.Namespace) -> int:
         completed_probes=completed_probes,
         failed_inspect_urls=failed_inspect_urls,
         cooldown_hours=args.cooldown_hours,
+        evaluated_probe_keys=evaluated_probe_keys,
     )
 
     probe_display_names = [

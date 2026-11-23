@@ -434,6 +434,42 @@ class TestGscAndGa4Evaluation(unittest.TestCase):
         )
         self.assertEqual(alerts_home[0].severity, "P0")
 
+    def test_gsc_site_t2_positive_metric_change_formats_plus_sign(self) -> None:
+        now_utc = datetime(2026, 11, 22, 9, 50, tzinfo=timezone.utc)
+        t2 = date(2026, 11, 20)
+
+        # Scenario A: Impressions drop 68.9% while clicks rise +5.2% -> must render (+5.2%), never (--5.2%)
+        daily_totals = {}
+        for d_off in range(30, 0, -1):
+            d = now_utc.date() - timedelta(days=d_off)
+            daily_totals[d] = {"clicks": 3494.0, "impressions": 31959.0, "position": 8.0}
+        daily_totals[t2] = {"clicks": 3674.0, "impressions": 9938.0, "position": 8.5}
+
+        alerts = mon.evaluate_gsc_traffic_series(
+            daily_totals=daily_totals,
+            daily_by_page={},
+            domain="krillion-game.app",
+            now_utc=now_utc,
+        )
+        by_key = {a.key: a for a in alerts}
+        self.assertIn("gsc_traffic:site_t2_drop", by_key)
+        detail = by_key["gsc_traffic:site_t2_drop"].detail
+        self.assertNotIn("--", detail)
+        self.assertIn("(+5.2%)", detail)
+        self.assertIn("(-68.9%)", detail)
+
+        # Scenario B: Zero click delta while impressions drop -> renders (0.0%), never (-0.0%)
+        daily_totals[t2] = {"clicks": 3494.0, "impressions": 10000.0, "position": 8.5}
+        alerts_zero = mon.evaluate_gsc_traffic_series(
+            daily_totals=daily_totals,
+            daily_by_page={},
+            domain="krillion-game.app",
+            now_utc=now_utc,
+        )
+        detail_zero = {a.key: a for a in alerts_zero}["gsc_traffic:site_t2_drop"].detail
+        self.assertIn("(0.0%)", detail_zero)
+        self.assertNotIn("-0.0%", detail_zero)
+
 
 class TestAlertReconcileAndTelegram(unittest.TestCase):
     def test_dedup_escalation_probe_guard_and_recovery(self) -> None:
@@ -519,6 +555,193 @@ class TestAlertReconcileAndTelegram(unittest.TestCase):
         chunks = mon.format_telegram_messages("krillion-game.app", [alert], [], [], {})
         self.assertEqual(len(chunks), 1)
         self.assertIn("&lt;tag&gt; &amp; _underscore_", chunks[0])
+
+    def test_skipped_low_baseline_and_incomplete_checks_do_not_falsely_resolve_alerts(self) -> None:
+        # 2026-11-20 is Friday; 2026-11-21 is Saturday
+        daily_totals: dict[date, dict[str, float]] = {}
+        home_series: dict[date, dict[str, float]] = {}
+        unlimited_series: dict[date, dict[str, float]] = {}
+        reset_series: dict[date, dict[str, float]] = {}
+
+        start_d = date(2026, 10, 20)
+        for day_i in range(40):
+            d = start_d + timedelta(days=day_i)
+            is_weekend = d.weekday() in (5, 6)
+            daily_totals[d] = {"clicks": 300.0, "impressions": 3000.0, "position": 3.0}
+            home_series[d] = {"clicks": 150.0, "impressions": 1500.0, "position": 2.0}
+            unlimited_series[d] = {
+                "clicks": 20.0 if is_weekend else 80.0,
+                "impressions": 500.0,
+                "position": 4.0,
+            }
+            reset_series[d] = {"clicks": 80.0, "impressions": 600.0, "position": 4.0}
+
+        def build_pages(cutoff: date) -> dict[str, dict[date, dict[str, float]]]:
+            return {
+                "https://krillion-game.app/": {d: v for d, v in home_series.items() if d < cutoff},
+                "https://krillion-game.app/unlimited/": {d: v for d, v in unlimited_series.items() if d < cutoff},
+                "https://krillion-game.app/strategy/reset-time/": {d: v for d, v in reset_series.items() if d < cutoff},
+            }
+
+        # Run 1 (evaluating Friday 2026-11-20): /unlimited/ drops to 0 on Friday -> P0 active
+        now_fri = datetime(2026, 11, 22, 9, 50, tzinfo=timezone.utc)
+        unlimited_series[date(2026, 11, 20)]["clicks"] = 0.0
+        eval_fri: set[str] = set()
+        alerts1 = mon.evaluate_gsc_traffic_series(
+            daily_totals={d: v for d, v in daily_totals.items() if d < now_fri.date()},
+            daily_by_page=build_pages(now_fri.date()),
+            domain="krillion-game.app",
+            now_utc=now_fri,
+            evaluated_keys=eval_fri,
+        )
+        self.assertEqual([a.key for a in alerts1], ["gsc_traffic:page:/unlimited/"])
+        self.assertIn("gsc_traffic:page:/unlimited/", eval_fri)
+        notify1, resolved1, state1 = mon.reconcile_alerts(
+            alerts1,
+            {"active_alerts": {}},
+            now_fri,
+            {"gsc_traffic"},
+            set(),
+            cooldown_hours=24,
+            evaluated_probe_keys={"gsc_traffic": eval_fri},
+        )
+        self.assertEqual(len(notify1), 1)
+        self.assertEqual(resolved1, [])
+        self.assertIn("gsc_traffic:page:/unlimited/", state1)
+
+        # Run 2 (evaluating Saturday 2026-11-21): /unlimited/ Saturday baseline is 20 (<40) so check is skipped;
+        # meanwhile /strategy/reset-time/ (Saturday baseline 80 >= 40) drops to 10 -> MUST NOT falsely resolve /unlimited/!
+        now_sat = datetime(2026, 11, 23, 10, 50, tzinfo=timezone.utc)
+        reset_series[date(2026, 11, 21)]["clicks"] = 10.0
+        eval_sat: set[str] = set()
+        alerts2 = mon.evaluate_gsc_traffic_series(
+            daily_totals={d: v for d, v in daily_totals.items() if d < now_sat.date()},
+            daily_by_page=build_pages(now_sat.date()),
+            domain="krillion-game.app",
+            now_utc=now_sat,
+            evaluated_keys=eval_sat,
+        )
+        self.assertEqual([a.key for a in alerts2], ["gsc_traffic:page:/strategy/reset-time/"])
+        self.assertNotIn("gsc_traffic:page:/unlimited/", eval_sat)
+        self.assertIn("gsc_traffic:page:/strategy/reset-time/", eval_sat)
+
+        notify2, resolved2, state2 = mon.reconcile_alerts(
+            alerts2,
+            {"active_alerts": state1},
+            now_sat,
+            {"gsc_traffic"},
+            set(),
+            cooldown_hours=24,
+            evaluated_probe_keys={"gsc_traffic": eval_sat},
+        )
+        self.assertEqual([a.key for a in notify2], ["gsc_traffic:page:/strategy/reset-time/"])
+        self.assertEqual(resolved2, [])
+        self.assertIn("gsc_traffic:page:/unlimited/", state2)
+        self.assertIn("gsc_traffic:page:/strategy/reset-time/", state2)
+
+        # Run 3: firstIncompleteDate lag pushes eval_t2 to None -> neither active alert resolves falsely
+        eval_lag: set[str] = set()
+        alerts3 = mon.evaluate_gsc_traffic_series(
+            daily_totals={d: v for d, v in daily_totals.items() if d < now_sat.date()},
+            daily_by_page=build_pages(now_sat.date()),
+            domain="krillion-game.app",
+            now_utc=now_sat,
+            first_incomplete_date=date(2026, 11, 18),
+            evaluated_keys=eval_lag,
+        )
+        self.assertEqual(alerts3, [])
+        self.assertNotIn("gsc_traffic:page:/unlimited/", eval_lag)
+        self.assertNotIn("gsc_traffic:page:/strategy/reset-time/", eval_lag)
+        _, resolved3, state3 = mon.reconcile_alerts(
+            alerts3,
+            {"active_alerts": state2},
+            now_sat + timedelta(hours=4),
+            {"gsc_traffic"},
+            set(),
+            cooldown_hours=24,
+            evaluated_probe_keys={"gsc_traffic": eval_lag},
+        )
+        self.assertEqual(resolved3, [])
+        self.assertEqual(set(state3.keys()), {"gsc_traffic:page:/unlimited/", "gsc_traffic:page:/strategy/reset-time/"})
+
+        # Run 4 (next Friday 2026-11-27 evaluated cleanly with both pages healthy) -> resolves cleanly!
+        now_next_fri = datetime(2026, 11, 29, 10, 50, tzinfo=timezone.utc)
+        unlimited_series[date(2026, 11, 27)]["clicks"] = 75.0
+        reset_series[date(2026, 11, 27)]["clicks"] = 78.0
+        eval_recovered: set[str] = set()
+        alerts4 = mon.evaluate_gsc_traffic_series(
+            daily_totals={d: v for d, v in daily_totals.items() if d < now_next_fri.date()},
+            daily_by_page=build_pages(now_next_fri.date()),
+            domain="krillion-game.app",
+            now_utc=now_next_fri,
+            evaluated_keys=eval_recovered,
+        )
+        self.assertEqual(alerts4, [])
+        self.assertIn("gsc_traffic:page:/unlimited/", eval_recovered)
+        self.assertIn("gsc_traffic:page:/strategy/reset-time/", eval_recovered)
+        _, resolved4, state4 = mon.reconcile_alerts(
+            alerts4,
+            {"active_alerts": state3},
+            now_next_fri,
+            {"gsc_traffic"},
+            set(),
+            cooldown_hours=24,
+            evaluated_probe_keys={"gsc_traffic": eval_recovered},
+        )
+        self.assertEqual({r["key"] for r in resolved4}, {"gsc_traffic:page:/unlimited/", "gsc_traffic:page:/strategy/reset-time/"})
+        self.assertEqual(state4, {})
+
+    def test_ga4_low_baseline_skip_and_stale_unverified_expiry(self) -> None:
+        now = datetime(2026, 11, 23, 10, 50, tzinfo=timezone.utc)
+        ga4_eval: set[str] = set()
+        ga4_alerts = mon.evaluate_ga4_daily_sessions(
+            daily_sessions={date(2026, 11, 15): 10.0, date(2026, 11, 22): 10.0},
+            domain="krillion-game.app",
+            now_utc=now,
+            min_sessions=20.0,
+            evaluated_keys=ga4_eval,
+        )
+        self.assertEqual(ga4_alerts, [])
+        self.assertNotIn("ga4:organic_drop", ga4_eval)
+
+        # Within TTL: unverified alert stays active and does not falsely resolve
+        prev_active = {
+            "ga4:organic_drop": {
+                "key": "ga4:organic_drop",
+                "probe": "ga4",
+                "severity": "P0",
+                "title": "GA4 异常",
+                "detail": "detail",
+                "url": "https://krillion-game.app/",
+                "signature": "2026-11-20:P0",
+                "first_seen": "2026-11-22T09:50:00Z",
+                "last_notified": "2026-11-22T09:50:00Z",
+            }
+        }
+        _, resolved_fresh, state_fresh = mon.reconcile_alerts(
+            [],
+            {"active_alerts": prev_active},
+            now,
+            {"ga4"},
+            set(),
+            cooldown_hours=24,
+            evaluated_probe_keys={"ga4": ga4_eval},
+        )
+        self.assertEqual(resolved_fresh, [])
+        self.assertIn("ga4:organic_drop", state_fresh)
+
+        # Past TTL (>14d unverified): quietly retired without claiming false recovery
+        _, resolved_stale, state_stale = mon.reconcile_alerts(
+            [],
+            {"active_alerts": prev_active},
+            now + timedelta(days=15),
+            {"ga4"},
+            set(),
+            cooldown_hours=24,
+            evaluated_probe_keys={"ga4": ga4_eval},
+        )
+        self.assertEqual(resolved_stale, [])
+        self.assertEqual(state_stale, {})
 
 
 if __name__ == "__main__":
