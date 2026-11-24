@@ -406,6 +406,43 @@ class TestSeoGate(unittest.TestCase):
         rc = gate.main(["--serve-cmd", f'"{sys.executable}" -c "import sys; sys.exit(3)"', "--serve-timeout", "5"])
         self.assertEqual(rc, 2)
 
+    def test_nav_sidebar_inside_main_excluded_from_overlap_while_article_header_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            shared_sidebar = " ".join(f"sidebar item {i} navigation link" for i in range(120))
+            _write_page(
+                dist,
+                "wiki/alpha/index.html",
+                f"""<!doctype html><html><head><title>Alpha Guide</title>
+                <link rel="canonical" href="https://example.com/wiki/alpha/" /></head>
+                <body><main>
+                <article><header><h1>Alpha Guide</h1><p>{_unique_words("alphalead", 40)}</p></header>
+                <p>{_unique_words("alphabody", 260)}</p>
+                <a href="/wiki/beta/">Beta Guide</a></article>
+                <nav aria-label="Wiki sidebar">{shared_sidebar}</nav>
+                </main></body></html>""",
+            )
+            _write_page(
+                dist,
+                "wiki/beta/index.html",
+                f"""<!doctype html><html><head><title>Beta Guide</title>
+                <link rel="canonical" href="https://example.com/wiki/beta/" /></head>
+                <body><main>
+                <article><header><h1>Beta Guide</h1><p>{_unique_words("betalead", 40)}</p></header>
+                <p>{_unique_words("betabody", 260)}</p>
+                <a href="/wiki/alpha/">Alpha Guide</a></article>
+                <nav aria-label="Wiki sidebar">{shared_sidebar}</nav>
+                </main></body></html>""",
+            )
+            _write_sitemap(dist, ["https://example.com/wiki/alpha/", "https://example.com/wiki/beta/"])
+
+            records, findings = gate.scan_site(dist, dict(gate.DEFAULT_CONFIG))
+            overlap_findings = [f for f in findings if f.gate == "template_overlap"]
+            self.assertEqual(overlap_findings, [])
+            by_path = {r.path: r for r in records}
+            self.assertGreaterEqual(by_path["/wiki/alpha/"].article_words, 300)
+            self.assertLess(by_path["/wiki/alpha/"].main_words, 350)
+
 
 if __name__ == "__main__":
     unittest.main()

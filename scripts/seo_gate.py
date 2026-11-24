@@ -189,6 +189,7 @@ class StaticPageParser(HTMLParser):
         self._main_depth = 0
         self._article_depth = 0
         self._nav_depth = 0
+        self._nav_tag_depth = 0
         self._details_depth = 0
 
         self.has_main = False
@@ -241,6 +242,8 @@ class StaticPageParser(HTMLParser):
             self._article_depth += 1
         elif tag in ("nav", "header", "footer"):
             self._nav_depth += 1
+            if tag == "nav":
+                self._nav_tag_depth += 1
         elif tag == "details":
             self._details_depth += 1
 
@@ -295,6 +298,8 @@ class StaticPageParser(HTMLParser):
             self._article_depth -= 1
         elif tag in ("nav", "header", "footer") and self._nav_depth > 0:
             self._nav_depth -= 1
+            if tag == "nav" and self._nav_tag_depth > 0:
+                self._nav_tag_depth -= 1
         elif tag == "details" and self._details_depth > 0:
             self._details_depth -= 1
 
@@ -317,11 +322,11 @@ class StaticPageParser(HTMLParser):
             self.h1_chunks.append(data)
         if self._in_heading:
             self._cur_heading_chunks.append(data)
-        if self._main_depth > 0:
+        if self._main_depth > 0 and self._nav_tag_depth == 0:
             self.main_text_chunks.append(data)
         if self._in_body and self._nav_depth == 0:
             self.body_text_chunks.append(data)
-        if self._article_depth > 0:
+        if self._article_depth > 0 and self._nav_tag_depth == 0:
             self.article_text_chunks.append(data)
         if self._details_depth > 0:
             self.details_text_chunks.append(data)
