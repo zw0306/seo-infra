@@ -3,10 +3,14 @@
 Pre-Release SEO Traffic-Light Gate for Tool & Game Websites (seo_gate.py)
 
 Zero external dependencies (Python 3 standard library only).
-Supports two target modes:
+Supports four target modes:
   - --dist <dir>:       Static build output (Astro dist/, Next.js static export out/, etc.)
   - --base-url <url>:   Live preview server or staging URL (Next.js SSR/App Router, OpenNext/vinext,
                         TanStack Start, Cloudflare Preview, e.g. http://localhost:3000)
+  - --project <dir>:    Auto-detect Astro/static (dist/, out/) or Next.js SSR (.next/BUILD_ID) and
+                        auto-load .seo-gate.json / seo-gate-baseline.json from project root
+  - --serve-cmd <cmd>:  Spawn a temporary local preview/SSR server (with {port} placeholder), scan
+                        http://localhost:{port}, and cleanly shut down the server process group
 
 Evaluates 5 deterministic SEO risk gates:
 
@@ -29,8 +33,14 @@ import argparse
 import concurrent.futures
 import html as html_lib
 import json
+import os
 import re
+import signal
+import socket
+import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -1419,13 +1429,211 @@ def load_config(config_path: Path | None, tool_paths: list[str]) -> dict[str, An
     return cfg
 
 
+PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def _clean_proxy_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in PROXY_ENV_VARS:
+        env.pop(key, None)
+    return env
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _has_static_site_artifacts(directory: Path) -> bool:
+    if not directory.is_dir():
+        return False
+    if (directory / "index.html").is_file():
+        return True
+    for name in ("sitemap-index.xml", "sitemap.xml", "sitemap-0.xml"):
+        if (directory / name).is_file():
+            return True
+    return False
+
+
+def detect_build_command(project_dir: Path) -> list[str]:
+    if (project_dir / "pnpm-lock.yaml").is_file():
+        return ["pnpm", "build"]
+    if (project_dir / "yarn.lock").is_file():
+        return ["yarn", "build"]
+    if (project_dir / "bun.lockb").is_file() or (project_dir / "bun.lock").is_file():
+        return ["bun", "run", "build"]
+    return ["npm", "run", "build"]
+
+
+def detect_project_target(project_dir: Path) -> tuple[str, Any]:
+    """
+    Auto-detect built site target inside a project directory.
+
+    Returns:
+      ("dist", Path)            for Astro/Vite static dist/, Next.js export out/, or Astro dist/client/
+      ("serve", list[str])      for Next.js SSR (.next/BUILD_ID) or Astro preview fallback
+      ("none", None)            when no built output is present
+    """
+    if _has_static_site_artifacts(project_dir / "dist"):
+        return "dist", project_dir / "dist"
+    if _has_static_site_artifacts(project_dir / "out"):
+        return "dist", project_dir / "out"
+    if (project_dir / ".next" / "BUILD_ID").is_file():
+        local_next = project_dir / "node_modules" / ".bin" / "next"
+        if local_next.is_file():
+            return "serve", [str(local_next), "start", "-p", "{port}"]
+        return "serve", ["npx", "next", "start", "-p", "{port}"]
+    if _has_static_site_artifacts(project_dir / "dist" / "client"):
+        return "dist", project_dir / "dist" / "client"
+    local_astro = project_dir / "node_modules" / ".bin" / "astro"
+    if (project_dir / "dist").is_dir() and local_astro.is_file():
+        return "serve", [str(local_astro), "preview", "--port", "{port}"]
+    return "none", None
+
+
+def _start_local_server(
+    cmd: str | list[str],
+    cwd: Path,
+    port: int,
+    env: dict[str, str],
+) -> tuple[subprocess.Popen[str], list[str]]:
+    if isinstance(cmd, str):
+        rendered: str | list[str] = cmd.replace("{port}", str(port))
+        use_shell = True
+    else:
+        rendered = [part.replace("{port}", str(port)) for part in cmd]
+        use_shell = False
+
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "shell": use_shell,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(rendered, **popen_kwargs)
+    stderr_lines: list[str] = []
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                if len(stderr_lines) > 200:
+                    del stderr_lines[:100]
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+    return proc, stderr_lines
+
+
+def _wait_for_server(
+    base_url: str,
+    proc: subprocess.Popen[str],
+    stderr_lines: list[str],
+    timeout: float,
+) -> None:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + max(timeout, 1.0)
+    probe_url = f"{base_url}/"
+    while time.monotonic() < deadline:
+        exit_code = proc.poll()
+        if exit_code is not None:
+            tail = "".join(stderr_lines[-20:]).strip()
+            raise RuntimeError(
+                f"Local server exited early (code {exit_code})."
+                + (f"\n{tail}" if tail else "")
+            )
+        try:
+            req = urllib.request.Request(probe_url, method="GET")
+            with opener.open(req, timeout=2.0) as resp:
+                if resp.status < 500:
+                    return
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                return
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    tail = "".join(stderr_lines[-20:]).strip()
+    raise RuntimeError(
+        f"Timed out waiting for local server at {base_url} after {timeout:.1f}s."
+        + (f"\n{tail}" if tail else "")
+    )
+
+
+def _stop_local_server(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None:
+        return
+    if proc.poll() is None:
+        try:
+            if os.name != "nt":
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            else:
+                proc.terminate()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name != "nt":
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                else:
+                    proc.kill()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+
+    if proc.stderr is not None:
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="5-gate pre-release SEO traffic-light scanner for tool & game sites (static dist/ or live --base-url)."
+        description=(
+            "5-gate pre-release SEO traffic-light scanner for tool & game sites "
+            "(Astro/static --dist, live --base-url, auto --project, or temporary --serve-cmd)."
+        )
     )
-    src_group = ap.add_mutually_exclusive_group(required=True)
-    src_group.add_argument("--dist", type=Path, help="Path to built static directory (e.g. ./dist or Next.js ./out)")
-    src_group.add_argument("--base-url", type=str, help="Live/preview base URL (e.g. http://localhost:3000 for Next.js SSR)")
+    ap.add_argument("--project", type=Path, default=None, help="Project root to auto-detect static dist/out or Next.js .next/BUILD_ID and load .seo-gate.json / seo-gate-baseline.json")
+    ap.add_argument("--dist", type=Path, default=None, help="Path to built static directory (e.g. ./dist or Next.js ./out)")
+    ap.add_argument("--base-url", type=str, default=None, help="Live/preview base URL (e.g. http://localhost:3000 for Next.js SSR)")
+    ap.add_argument("--serve-cmd", type=str, default=None, help="Command to boot a temporary local server (supports {port}, e.g. 'npx next start -p {port}' or 'npx astro preview --port {port}')")
+    ap.add_argument("--cwd", type=Path, default=None, help="Working directory for --serve-cmd / --build (defaults to --project or cwd)")
+    ap.add_argument("--build", action="store_true", help="Run project build before scanning (--project or --cwd)")
+    ap.add_argument("--build-cmd", type=str, default=None, help="Explicit build command to run when --build is set")
+    ap.add_argument("--port", type=int, default=0, help="Port for temporary local server (0 = auto free port)")
+    ap.add_argument("--serve-timeout", type=float, default=30.0, help="Startup timeout in seconds for temporary local server")
     ap.add_argument("--sitemap", type=str, default=None, help="Optional explicit sitemap file path (--dist) or path/URL (--base-url)")
     ap.add_argument("--config", type=Path, default=None, help="Optional JSON config overriding thresholds/tool_paths")
     ap.add_argument("--tool-path", action="append", default=[], help="Explicit glob/path treated as interactive tool page")
@@ -1435,53 +1643,135 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-proxy", action="store_true", help="Bypass HTTP/HTTPS proxy env vars in --base-url mode (auto-enabled for localhost)")
     ap.add_argument("--warn-only", action="store_true", help="Always exit 0 (report only)")
     ap.add_argument("--baseline", type=Path, default=None, help="Ratchet baseline JSON (only NEW RED findings exit 1)")
+    ap.add_argument("--no-baseline", action="store_true", help="Ignore auto-discovered seo-gate-baseline.json in --project mode")
     ap.add_argument("--write-baseline", type=Path, default=None, help="Write current finding keys to baseline JSON")
     ap.add_argument("--format", choices=("markdown", "json"), default="markdown", help="Output format")
     args = ap.parse_args(argv)
 
-    cfg = load_config(args.config, args.tool_path)
+    explicit_modes = [m for m in (args.dist is not None, args.base_url is not None, args.serve_cmd is not None) if m]
+    if len(explicit_modes) > 1:
+        print("ERROR: --dist, --base-url, and --serve-cmd are mutually exclusive.", file=sys.stderr)
+        return 2
+    if not explicit_modes and args.project is None:
+        print("ERROR: specify one of --project, --dist, --base-url, or --serve-cmd.", file=sys.stderr)
+        return 2
 
-    if args.dist is not None:
-        if not args.dist.is_dir():
-            print(f"ERROR: dist directory not found: {args.dist}", file=sys.stderr)
-            return 2
-        target_label = str(args.dist)
-        records, findings = scan_site(
-            args.dist,
-            cfg,
-            explicit_sitemap=Path(args.sitemap) if args.sitemap else None,
+    project_dir = args.project.resolve() if args.project is not None else None
+    if project_dir is not None and not project_dir.is_dir():
+        print(f"ERROR: project directory not found: {project_dir}", file=sys.stderr)
+        return 2
+
+    work_dir = (args.cwd.resolve() if args.cwd is not None else project_dir) or Path.cwd()
+    clean_env = _clean_proxy_env()
+
+    if args.build:
+        build_cmd: str | list[str] = args.build_cmd if args.build_cmd else detect_build_command(work_dir)
+        build_res = subprocess.run(
+            build_cmd,
+            cwd=str(work_dir),
+            env=clean_env,
+            shell=isinstance(build_cmd, str),
         )
-    else:
-        base_url = args.base_url.strip().rstrip("/")
-        if not base_url.startswith(("http://", "https://")):
-            print(f"ERROR: --base-url must start with http:// or https://: {base_url}", file=sys.stderr)
+        if build_res.returncode != 0:
+            print(f"ERROR: build command failed with exit code {build_res.returncode}.", file=sys.stderr)
+            return build_res.returncode
+
+    config_path = args.config
+    if config_path is None and project_dir is not None:
+        candidate_cfg = project_dir / ".seo-gate.json"
+        if candidate_cfg.is_file():
+            config_path = candidate_cfg
+
+    baseline_path = args.baseline
+    if (
+        baseline_path is None
+        and not args.no_baseline
+        and args.write_baseline is None
+        and project_dir is not None
+    ):
+        candidate_base = project_dir / "seo-gate-baseline.json"
+        if candidate_base.is_file():
+            baseline_path = candidate_base
+
+    cfg = load_config(config_path, args.tool_path)
+
+    resolved_dist: Path | None = args.dist
+    resolved_base_url: str | None = args.base_url
+    serve_cmd: str | list[str] | None = args.serve_cmd
+
+    if resolved_dist is None and resolved_base_url is None and serve_cmd is None and project_dir is not None:
+        kind, value = detect_project_target(project_dir)
+        if kind == "dist":
+            resolved_dist = value
+        elif kind == "serve":
+            serve_cmd = value
+        else:
+            print(
+                f"ERROR: No built output found under {project_dir}. "
+                "Expected static dist/ (Astro/Vite), out/ (Next.js static export), or .next/BUILD_ID (Next.js SSR). "
+                "Run your build first, or pass --build / --dist / --base-url / --serve-cmd.",
+                file=sys.stderr,
+            )
             return 2
-        target_label = base_url
-        records, findings = scan_live_site(
-            base_url,
-            cfg,
-            explicit_sitemap=args.sitemap,
-            timeout=args.timeout,
-            concurrency=args.concurrency,
-            max_pages=args.max_pages,
-            no_proxy=args.no_proxy,
-        )
+
+    server_proc: subprocess.Popen[str] | None = None
+    try:
+        if resolved_dist is not None:
+            if not resolved_dist.is_dir():
+                print(f"ERROR: dist directory not found: {resolved_dist}", file=sys.stderr)
+                return 2
+            target_label = str(resolved_dist)
+            records, findings = scan_site(
+                resolved_dist,
+                cfg,
+                explicit_sitemap=Path(args.sitemap) if args.sitemap else None,
+            )
+        else:
+            use_no_proxy = args.no_proxy
+            if serve_cmd is not None:
+                port = args.port or _find_free_port()
+                resolved_base_url = f"http://localhost:{port}"
+                use_no_proxy = True
+                server_proc, stderr_lines = _start_local_server(serve_cmd, work_dir, port, clean_env)
+                _wait_for_server(resolved_base_url, server_proc, stderr_lines, args.serve_timeout)
+
+            assert resolved_base_url is not None
+            base_url = resolved_base_url.strip().rstrip("/")
+            if not base_url.startswith(("http://", "https://")):
+                print(f"ERROR: --base-url must start with http:// or https://: {base_url}", file=sys.stderr)
+                return 2
+            resolved_base_url = base_url
+            target_label = base_url
+            records, findings = scan_live_site(
+                base_url,
+                cfg,
+                explicit_sitemap=args.sitemap,
+                timeout=args.timeout,
+                concurrency=args.concurrency,
+                max_pages=args.max_pages,
+                no_proxy=use_no_proxy,
+            )
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        _stop_local_server(server_proc)
 
     fixed_keys: list[str] = []
     if args.write_baseline:
         write_baseline(findings, args.write_baseline)
 
-    mode = "warn-only" if args.warn_only else ("baseline-ratchet" if args.baseline else "strict")
-    if args.baseline and args.baseline.is_file():
-        findings, fixed_keys = apply_baseline(findings, args.baseline)
+    mode = "warn-only" if args.warn_only else ("baseline-ratchet" if baseline_path else "strict")
+    if baseline_path and baseline_path.is_file():
+        findings, fixed_keys = apply_baseline(findings, baseline_path)
 
     active_red = [f for f in findings if f.severity == "RED" and not f.baselined]
 
     if args.format == "json":
         output = {
             "target": target_label,
-            "dist": str(args.dist) if args.dist is not None else None,
-            "base_url": target_label if args.base_url else None,
+            "dist": str(resolved_dist) if resolved_dist is not None else None,
+            "base_url": resolved_base_url,
             "mode": mode,
             "page_count": len(records),
             "gate_status": gate_status_summary(findings),

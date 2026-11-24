@@ -322,6 +322,90 @@ class TestSeoGate(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_detect_project_target_astro_and_nextjs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # Empty project -> none
+            self.assertEqual(gate.detect_project_target(root), ("none", None))
+
+            # Next.js SSR (.next/BUILD_ID) -> serve
+            (root / ".next").mkdir()
+            (root / ".next" / "BUILD_ID").write_text("build123", encoding="utf-8")
+            kind, cmd = gate.detect_project_target(root)
+            self.assertEqual(kind, "serve")
+            self.assertIn("start", cmd)
+            self.assertIn("{port}", cmd)
+
+            # Next.js static export (out/) takes precedence over .next/
+            (root / "out").mkdir()
+            (root / "out" / "index.html").write_text("<html></html>", encoding="utf-8")
+            self.assertEqual(gate.detect_project_target(root), ("dist", root / "out"))
+
+            # Astro static (dist/) takes top precedence
+            (root / "dist").mkdir()
+            (root / "dist" / "index.html").write_text("<html></html>", encoding="utf-8")
+            self.assertEqual(gate.detect_project_target(root), ("dist", root / "dist"))
+
+    def test_project_auto_detect_astro_loads_config_and_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            dist = project / "dist"
+            _write_page(
+                dist,
+                "index.html",
+                f"""<!doctype html><html><head><title>Astro Game</title>
+                <link rel="canonical" href="https://example.com/" /></head>
+                <body><main><h1>Astro Game</h1><canvas></canvas>
+                <p>{_unique_words("home", 120)}</p></main></body></html>""",
+            )
+            _write_page(
+                dist,
+                "thin/index.html",
+                """<!doctype html><html><head><title>Thin Guide</title>
+                <link rel="canonical" href="https://example.com/thin/" /></head>
+                <body><main><h1>Thin Guide</h1><p>Too short.</p></main></body></html>""",
+            )
+            _write_sitemap(dist, ["https://example.com/", "https://example.com/thin/"])
+
+            # Strict fails due to thin content RED
+            self.assertEqual(gate.main(["--project", str(project)]), 1)
+
+            # Write baseline into project root
+            baseline_file = project / "seo-gate-baseline.json"
+            self.assertEqual(
+                gate.main(["--project", str(project), "--write-baseline", str(baseline_file), "--warn-only"]),
+                0,
+            )
+            self.assertTrue(baseline_file.is_file())
+
+            # --project auto-loads seo-gate-baseline.json and passes in ratchet mode
+            self.assertEqual(gate.main(["--project", str(project)]), 0)
+
+            # --no-baseline forces strict mode even when baseline exists
+            self.assertEqual(gate.main(["--project", str(project), "--no-baseline"]), 1)
+
+    def test_serve_cmd_boots_and_stops_local_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            site = Path(tmp)
+            _write_page(
+                site,
+                "index.html",
+                f"""<!doctype html><html><head><title>SSR Tool</title>
+                <link rel="canonical" href="https://example.com/" /></head>
+                <body><main><h1>SSR Tool</h1><canvas></canvas>
+                <p>{_unique_words("ssr", 150)}</p></main></body></html>""",
+            )
+            _write_sitemap(site, ["https://example.com/"])
+
+            serve_cmd = f'"{sys.executable}" -m http.server {{port}} --bind 127.0.0.1 --directory "{site}"'
+            rc = gate.main(["--serve-cmd", serve_cmd, "--serve-timeout", "10", "--format", "json"])
+            self.assertEqual(rc, 0)
+
+    def test_serve_cmd_early_exit_returns_error_fast(self) -> None:
+        rc = gate.main(["--serve-cmd", f'"{sys.executable}" -c "import sys; sys.exit(3)"', "--serve-timeout", "5"])
+        self.assertEqual(rc, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

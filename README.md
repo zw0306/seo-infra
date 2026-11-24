@@ -9,7 +9,7 @@ SEO 报表基础设施仓库，集中管理所有项目通用的 SEO 周报自�
   seo-report-core.yml       # Google SEO 周报（Reusable Workflow）
   seo-monitor-core.yml      # SEO 异常健康监控与告警（Reusable Workflow）
 scripts/
-  seo_gate.py                 # 上线前 5 项 SEO 红绿灯门禁（零依赖，支持 --dist 静态目录与 --base-url Next.js SSR/预览服）
+  seo_gate.py                 # 上线前 5 项 SEO 红绿灯门禁（零依赖，支持 --project 自动识别 Astro/Next.js、--dist、--base-url 与 --serve-cmd）
   seo_health_monitor.py       # HTTP / GSC 抓取收录 / Sitemap / GSC+GA4 流量异动监控
   seo_weekly_summary.py       # Telegram 极简摘要生成
   generate_weekly_markdown.py # 语义聚类深度周报生成（支持 CTR 异常词分析 + 趋势 Section）
@@ -147,6 +147,23 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+```
+
+### 上线前 5-Gate SEO 门禁（`seo_gate.py`）
+
+同时支持 Astro 静态导出（`dist/`）、Next.js 静态导出（`out/`）、Next.js SSR（`.next/BUILD_ID`）及任意自定义预览服：
+
+```bash
+# 1. 自动识别项目类型（自动读取 .seo-gate.json 与 seo-gate-baseline.json）
+#    - Astro / Vite 静态站：直接扫描 dist/
+#    - Next.js SSR 站：自动在空闲端口启停 next start 并扫描 http://localhost:<port>
+python3 scripts/seo_gate.py --project /path/to/your-site
+
+# 2. 自定义本地预览服命令（支持 {port} 占位符）
+python3 scripts/seo_gate.py --project . --serve-cmd "npx astro preview --port {port}"
+
+# 3. 写入/刷新存量基线
+python3 scripts/seo_gate.py --project . --write-baseline seo-gate-baseline.json --warn-only
 ```
 
 ### 运行单元测试
