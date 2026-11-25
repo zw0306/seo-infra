@@ -443,6 +443,93 @@ class TestSeoGate(unittest.TestCase):
             self.assertGreaterEqual(by_path["/wiki/alpha/"].article_words, 300)
             self.assertLess(by_path["/wiki/alpha/"].main_words, 350)
 
+    def test_gate6_onpage_tdh_intent_catches_drift_stuffing_and_multi_h1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            dist = project / "dist"
+            # Page 1: clean, well-aligned page -> GREEN
+            _write_page(
+                dist,
+                "packs/movies/index.html",
+                f"""<!doctype html><html><head>
+                <title>Krillion Movies Pack: Play At the Movies Trivia Free</title>
+                <meta name="description" content="Play the Krillion Movies pack (At the Movies) free online. Score 100-point rare answers across cinema, film directors, and classic Hollywood prompts." />
+                <link rel="canonical" href="https://example.com/packs/movies/" /></head>
+                <body><main><h1>Krillion Movies Pack: At the Movies Trivia</h1><canvas></canvas>
+                <p>Play Krillion movies online with cinema and film prompts. {_unique_words("cinema", 160)}</p>
+                <a href="/packs/drift/">Drift</a><a href="/packs/stuffed/">Stuffed</a></main></body></html>""",
+            )
+            # Page 2: topic drift (0 body occurrences of primary) + missing synonyms + multi H1
+            _write_page(
+                dist,
+                "packs/drift/index.html",
+                f"""<!doctype html><html><head>
+                <title>Generic Trivia Pack</title>
+                <meta name="description" content="Short desc." />
+                <link rel="canonical" href="https://example.com/packs/drift/" /></head>
+                <body><main><h1>First Heading</h1><h1>Second Heading</h1><canvas></canvas>
+                <p>{_unique_words("unrelated", 140)}</p>
+                <a href="/packs/movies/">Movies</a></main></body></html>""",
+            )
+            # Page 3: keyword stuffing (>3.5% density)
+            stuffed = " ".join(["rare trivia"] * 12)
+            _write_page(
+                dist,
+                "packs/stuffed/index.html",
+                f"""<!doctype html><html><head>
+                <title>Rare Trivia Challenge Online: Play Free Daily Mode</title>
+                <meta name="description" content="Play Rare Trivia free online with daily rounds, obscure answers, and instant scoring across curated prompts." />
+                <link rel="canonical" href="https://example.com/packs/stuffed/" /></head>
+                <body><main><h1>Rare Trivia Challenge</h1><canvas></canvas>
+                <p>{stuffed} {_unique_words("filler", 120)}</p>
+                <a href="/packs/movies/">Movies</a></main></body></html>""",
+            )
+            _write_sitemap(
+                dist,
+                [
+                    "https://example.com/packs/movies/",
+                    "https://example.com/packs/drift/",
+                    "https://example.com/packs/stuffed/",
+                ],
+            )
+            kw_file = project / "seo-gate-keywords.json"
+            kw_file.write_text(
+                json.dumps(
+                    {
+                        "/packs/movies/": {
+                            "primary": "krillion movies",
+                            "synonyms": ["at the movies", "cinema", "film"],
+                        },
+                        "/packs/drift/": {
+                            "primary": "krillion geography",
+                            "synonyms": ["geography game", "countries", "capitals"],
+                        },
+                        "/packs/stuffed/": {
+                            "primary": "rare trivia",
+                            "synonyms": ["obscure answers"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            cfg = gate.load_config(None, [], keywords_path=kw_file)
+            _, findings = gate.scan_site(dist, cfg)
+            g6 = [f for f in findings if f.gate == "onpage_tdh_intent"]
+            keys = {f.key: f.severity for f in g6}
+
+            # Clean page has zero Gate 6 findings
+            self.assertFalse(any(f.target == "/packs/movies/" for f in g6))
+            # Drift page triggers multi_h1 RED, body_missing_pk RED, missing_synonyms RED
+            self.assertEqual(keys.get("onpage_tdh_intent:multi_h1:/packs/drift/"), "RED")
+            self.assertEqual(keys.get("onpage_tdh_intent:body_missing_pk:/packs/drift/"), "RED")
+            self.assertEqual(keys.get("onpage_tdh_intent:missing_synonyms:/packs/drift/"), "RED")
+            # Stuffed page triggers pk_stuffing RED
+            self.assertEqual(keys.get("onpage_tdh_intent:pk_stuffing:/packs/stuffed/"), "RED")
+
+            # Auto-discovery in --project mode fails strict exit 1 due to Gate 6 RED
+            self.assertEqual(gate.main(["--project", str(project)]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

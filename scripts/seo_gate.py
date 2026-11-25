@@ -12,13 +12,14 @@ Supports four target modes:
   - --serve-cmd <cmd>:  Spawn a temporary local preview/SSR server (with {port} placeholder), scan
                         http://localhost:{port}, and cleanly shut down the server process group
 
-Evaluates 5 deterministic SEO risk gates:
+Evaluates 6 deterministic SEO risk gates:
 
   1. page_budget           — Interactive tool/game page prose cap & pseudo-academic bloat; thin content check
   2. payload_bloat         — Oversized static HTML payload (>250 KB) & low text-to-HTML ratio
   3. template_overlap      — Pairwise 5-gram containment across sitemap pages (catches template farms/duplication)
   4. intent_cannibalization— Cross-type twin pages competing for the same head topic (e.g. /mode/ vs /modes/mode/)
   5. index_hygiene         — Sitemap vs HTTP 200/redirect/noindex/canonical/missing-file/duplicate-title/orphan checks
+  6. onpage_tdh_intent     — Multi-H1, TDH length & primary keyword placement, keyword density guard, synonym coverage
 
 Execution modes:
   - Default (--strict):    exit 1 if any RED finding exists
@@ -70,6 +71,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "overlap_containment_red": 0.35,
     "overlap_min_shared_5grams": 60,
     "cannibal_slug_stems_ignore": ["index", "home", "about", "faq", "contact", "privacy", "terms"],
+    "title_min_chars": 25,
+    "title_max_chars": 65,
+    "title_max_chars_hard": 85,
+    "desc_min_chars": 100,
+    "desc_max_chars": 160,
+    "desc_max_chars_hard": 165,
+    "keyword_density_warn": 2.5,
+    "keyword_density_red": 3.5,
+    "keyword_min_occurrences": 1,
+    "page_keywords": {},
     "tool_paths": [],
     "content_paths": [],
     "ignore_paths": [],
@@ -125,7 +136,9 @@ class PageRecord:
     redirected_to: str = ""
     html_bytes: int = 0
     title: str = ""
+    meta_description: str = ""
     h1: str = ""
+    h1_count: int = 0
     headings: list[str] = field(default_factory=list)
     canonical: str = ""
     robots: str = ""
@@ -137,6 +150,7 @@ class PageRecord:
     main_words: int = 0
     article_words: int = 0
     prose_words: int = 0
+    main_text_lower: str = ""
     main_text_bytes: int = 0
     text_ratio: float = 0.0
     details_bytes: int = 0
@@ -184,6 +198,8 @@ class StaticPageParser(HTMLParser):
 
         self.canonical = ""
         self.robots = ""
+        self.meta_description = ""
+        self.h1_count = 0
 
         self._skip_depth = 0
         self._main_depth = 0
@@ -229,6 +245,10 @@ class StaticPageParser(HTMLParser):
                 content = attr_map.get("content", "")
                 if content:
                     self.robots = f"{self.robots}, {content}".strip(", ")
+            elif name == "description" and not self.meta_description:
+                content = attr_map.get("content", "").strip()
+                if content:
+                    self.meta_description = content
         elif tag == "link":
             rel = attr_map.get("rel", "").lower().split()
             if "canonical" in rel and attr_map.get("href"):
@@ -248,8 +268,10 @@ class StaticPageParser(HTMLParser):
             self._details_depth += 1
 
         if self._skip_depth == 0:
-            if tag == "h1" and not self.h1_chunks:
-                self._in_h1 = True
+            if tag == "h1":
+                self.h1_count += 1
+                if not self.h1_chunks:
+                    self._in_h1 = True
             if tag in ("h1", "h2", "h3"):
                 self._in_heading = True
                 self._cur_heading_chunks = []
@@ -680,7 +702,9 @@ def _populate_record_from_html(
     parser.close()
 
     rec.title = re.sub(r"\s+", " ", html_lib.unescape("".join(parser.title_chunks))).strip()
+    rec.meta_description = re.sub(r"\s+", " ", html_lib.unescape(parser.meta_description)).strip()
     rec.h1 = re.sub(r"\s+", " ", html_lib.unescape("".join(parser.h1_chunks))).strip()
+    rec.h1_count = parser.h1_count
     rec.headings = parser.headings
     rec.canonical = parser.canonical
     rec.robots = parser.robots
@@ -700,6 +724,7 @@ def _populate_record_from_html(
     rec.main_words = len(main_word_list)
     rec.article_words = len(article_word_list)
     rec.prose_words = rec.article_words if rec.has_article_tag and rec.article_words > 0 else rec.main_words
+    rec.main_text_lower = main_text.lower()
     rec.main_text_bytes = len(main_text.encode("utf-8"))
     rec.text_ratio = (rec.main_text_bytes / rec.html_bytes) if rec.html_bytes > 0 else 0.0
 
@@ -747,6 +772,7 @@ def _evaluate_records(records: list[PageRecord], cfg: dict[str, Any]) -> list[Fi
     findings.extend(_gate_template_overlap(records, cfg))
     findings.extend(_gate_intent_cannibalization(records, cfg))
     findings.extend(_gate_index_hygiene(records))
+    findings.extend(_gate_onpage_tdh_intent(records, cfg))
 
     # Sort deterministically: RED first, then gate, then key
     severity_rank = {"RED": 0, "YELLOW": 1}
@@ -1317,6 +1343,255 @@ def _gate_index_hygiene(records: list[PageRecord]) -> list[Finding]:
     return findings
 
 
+def _count_phrase_occurrences(text_lower: str, phrase: str) -> int:
+    clean = re.sub(r"\s+", " ", phrase.strip().lower())
+    if not clean:
+        return 0
+    pattern = r"(?<!\w)" + r"\s+".join(re.escape(part) for part in clean.split()) + r"(?!\w)"
+    return len(re.findall(pattern, text_lower))
+
+
+def _gate_onpage_tdh_intent(records: list[PageRecord], cfg: dict[str, Any]) -> list[Finding]:
+    """
+    Gate 6: On-page TDH hygiene, primary keyword presence/density guard, and synonym coverage.
+    Always validates multi-H1 and extreme title/description truncation.
+    When `page_keywords` (via --keywords / .seo-gate.json / seo-gate-keywords.json) is provided,
+    validates TDH placement, body keyword density (missing vs stuffing), and semantic synonyms.
+    """
+    findings: list[Finding] = []
+    raw_kw_map = cfg.get("page_keywords") or {}
+    if isinstance(raw_kw_map, dict) and "pages" in raw_kw_map and isinstance(raw_kw_map["pages"], dict):
+        raw_kw_map = raw_kw_map["pages"]
+    kw_map: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_kw_map, dict):
+        for k, v in raw_kw_map.items():
+            if isinstance(v, dict):
+                kw_map[normalize_path(k)] = v
+
+    title_min = int(cfg.get("title_min_chars", 25))
+    title_max = int(cfg.get("title_max_chars", 65))
+    title_hard = int(cfg.get("title_max_chars_hard", 85))
+    desc_min = int(cfg.get("desc_min_chars", 100))
+    desc_max = int(cfg.get("desc_max_chars", 160))
+    desc_hard = int(cfg.get("desc_max_chars_hard", 165))
+    dens_warn = float(cfg.get("keyword_density_warn", 2.5))
+    dens_red = float(cfg.get("keyword_density_red", 3.5))
+    min_occ = int(cfg.get("keyword_min_occurrences", 1))
+
+    for r in records:
+        if not r.exists or r.noindex:
+            continue
+
+        # Always-on structural TDH checks
+        if r.h1_count > 1:
+            findings.append(
+                Finding(
+                    gate="onpage_tdh_intent",
+                    severity="RED",
+                    key=f"onpage_tdh_intent:multi_h1:{r.path}",
+                    target=r.path,
+                    message=f"Page renders {r.h1_count} <h1> tags (must have exactly 1 for clear topical hierarchy).",
+                    metric={"h1_count": r.h1_count},
+                )
+            )
+
+        spec = kw_map.get(r.path)
+        protect_tdh = bool(spec.get("protect_tdh", False)) if spec else False
+
+        if r.title and not protect_tdh:
+            tlen = len(r.title)
+            if tlen > title_hard:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="RED",
+                        key=f"onpage_tdh_intent:title_too_long:{r.path}",
+                        target=r.path,
+                        message=f"<title> is severely overlong ({tlen} chars > {title_hard}): '{r.title[:70]}...'.",
+                        metric={"title_len": tlen},
+                    )
+                )
+            elif spec and tlen > title_max:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="YELLOW",
+                        key=f"onpage_tdh_intent:title_truncate:{r.path}",
+                        target=r.path,
+                        message=f"<title> is {tlen} chars (> {title_max} SERP truncation risk): '{r.title}'.",
+                        metric={"title_len": tlen},
+                    )
+                )
+            elif spec and tlen < title_min:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="YELLOW",
+                        key=f"onpage_tdh_intent:title_short:{r.path}",
+                        target=r.path,
+                        message=f"<title> is too short ({tlen} chars < {title_min}): '{r.title}'.",
+                        metric={"title_len": tlen},
+                    )
+                )
+
+        if r.meta_description and not protect_tdh:
+            dlen = len(r.meta_description)
+            if dlen > desc_hard:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="YELLOW",
+                        key=f"onpage_tdh_intent:desc_truncate:{r.path}",
+                        target=r.path,
+                        message=f"Meta description is {dlen} chars (> {desc_hard} SERP truncation risk).",
+                        metric={"desc_len": dlen},
+                    )
+                )
+            elif spec and dlen > desc_max:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="YELLOW",
+                        key=f"onpage_tdh_intent:desc_truncate:{r.path}",
+                        target=r.path,
+                        message=f"Meta description is {dlen} chars (> {desc_max} ideal cap).",
+                        metric={"desc_len": dlen},
+                    )
+                )
+            elif spec and dlen < desc_min:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="YELLOW",
+                        key=f"onpage_tdh_intent:desc_short:{r.path}",
+                        target=r.path,
+                        message=f"Meta description is too short ({dlen} chars < {desc_min}).",
+                        metric={"desc_len": dlen},
+                    )
+                )
+
+        if not spec:
+            continue
+
+        if not r.meta_description and not protect_tdh:
+            findings.append(
+                Finding(
+                    gate="onpage_tdh_intent",
+                    severity="YELLOW",
+                    key=f"onpage_tdh_intent:no_desc:{r.path}",
+                    target=r.path,
+                    message="Missing <meta name='description'> tag.",
+                )
+            )
+
+        primary = str(spec.get("primary") or "").strip()
+        if primary:
+            pk_low = primary.lower()
+            if not protect_tdh:
+                if r.title and _count_phrase_occurrences(r.title.lower(), pk_low) == 0:
+                    findings.append(
+                        Finding(
+                            gate="onpage_tdh_intent",
+                            severity="YELLOW",
+                            key=f"onpage_tdh_intent:title_missing_pk:{r.path}",
+                            target=r.path,
+                            message=f"<title> is missing primary keyword '{primary}' (got '{r.title}').",
+                            metric={"primary": primary},
+                        )
+                    )
+                if r.h1 and _count_phrase_occurrences(r.h1.lower(), pk_low) == 0:
+                    findings.append(
+                        Finding(
+                            gate="onpage_tdh_intent",
+                            severity="YELLOW",
+                            key=f"onpage_tdh_intent:h1_missing_pk:{r.path}",
+                            target=r.path,
+                            message=f"<h1> is missing primary keyword '{primary}' (got '{r.h1}').",
+                            metric={"primary": primary},
+                        )
+                    )
+                if r.meta_description and _count_phrase_occurrences(r.meta_description.lower(), pk_low) == 0:
+                    findings.append(
+                        Finding(
+                            gate="onpage_tdh_intent",
+                            severity="YELLOW",
+                            key=f"onpage_tdh_intent:desc_missing_pk:{r.path}",
+                            target=r.path,
+                            message=f"Meta description is missing primary keyword '{primary}'.",
+                            metric={"primary": primary},
+                        )
+                    )
+
+            occ = _count_phrase_occurrences(r.main_text_lower, pk_low)
+            pk_word_len = max(len(pk_low.split()), 1)
+            density = (occ * pk_word_len / max(r.main_words, 1)) * 100.0
+            if occ < min_occ:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="RED",
+                        key=f"onpage_tdh_intent:body_missing_pk:{r.path}",
+                        target=r.path,
+                        message=(
+                            f"Topic drift risk: primary keyword '{primary}' appears {occ} times in <main> "
+                            f"(min required: {min_occ})."
+                        ),
+                        metric={"primary": primary, "occurrences": occ, "density_pct": round(density, 2)},
+                    )
+                )
+            elif density > dens_red:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="RED",
+                        key=f"onpage_tdh_intent:pk_stuffing:{r.path}",
+                        target=r.path,
+                        message=(
+                            f"Keyword stuffing risk: '{primary}' density is {density:.1f}% "
+                            f"({occ}x across {r.main_words}w, red threshold >{dens_red:.1f}%)."
+                        ),
+                        metric={"primary": primary, "occurrences": occ, "density_pct": round(density, 2)},
+                    )
+                )
+            elif density > dens_warn:
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity="YELLOW",
+                        key=f"onpage_tdh_intent:pk_density_high:{r.path}",
+                        target=r.path,
+                        message=(
+                            f"Primary keyword '{primary}' density is elevated at {density:.1f}% "
+                            f"({occ}x across {r.main_words}w, warn threshold >{dens_warn:.1f}%)."
+                        ),
+                        metric={"primary": primary, "occurrences": occ, "density_pct": round(density, 2)},
+                    )
+                )
+
+        synonyms = [str(s).strip() for s in (spec.get("synonyms") or []) if str(s).strip()]
+        if synonyms:
+            haystack = f"{r.title} {r.meta_description} {r.h1} {r.main_text_lower}".lower()
+            missing = [s for s in synonyms if _count_phrase_occurrences(haystack, s.lower()) == 0]
+            if missing:
+                miss_ratio = len(missing) / len(synonyms)
+                sev = "RED" if (len(synonyms) >= 2 and miss_ratio >= 0.5 and not protect_tdh) else "YELLOW"
+                findings.append(
+                    Finding(
+                        gate="onpage_tdh_intent",
+                        severity=sev,
+                        key=f"onpage_tdh_intent:missing_synonyms:{r.path}",
+                        target=r.path,
+                        message=(
+                            f"Missing {len(missing)}/{len(synonyms)} target synonyms/sub-intents: "
+                            f"{', '.join(missing)}."
+                        ),
+                        metric={"missing": missing, "total_synonyms": len(synonyms)},
+                    )
+                )
+
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Baseline Ratchet & Reporting
 # ---------------------------------------------------------------------------
@@ -1343,7 +1618,14 @@ def write_baseline(findings: list[Finding], baseline_path: Path) -> None:
 
 
 def gate_status_summary(findings: list[Finding]) -> dict[str, str]:
-    gates = ["page_budget", "payload_bloat", "template_overlap", "intent_cannibalization", "index_hygiene"]
+    gates = [
+        "page_budget",
+        "payload_bloat",
+        "template_overlap",
+        "intent_cannibalization",
+        "index_hygiene",
+        "onpage_tdh_intent",
+    ]
     status: dict[str, str] = {}
     for g in gates:
         gf = [f for f in findings if f.gate == g and not f.baselined]
@@ -1369,6 +1651,7 @@ def format_markdown(
         "template_overlap": "3. Site-Wide 5-Gram Overlap",
         "intent_cannibalization": "4. Twin Intent Cannibalization",
         "index_hygiene": "5. Sitemap / Index Hygiene",
+        "onpage_tdh_intent": "6. On-Page TDH & Keyword Intent",
     }
     icons = {"GREEN": "🟢 PASS", "YELLOW": "🟡 WARN", "RED": "🔴 FAIL"}
 
@@ -1419,16 +1702,27 @@ def format_markdown(
             lines.append(f"- `{k}`")
 
     if not active_red and not active_yellow:
-        lines.extend(["", "🟢 **All 5 SEO pre-release gates passed with zero active warnings.**"])
+        lines.extend(["", "🟢 **All 6 SEO pre-release gates passed with zero active warnings.**"])
 
     return "\n".join(lines) + "\n"
 
 
-def load_config(config_path: Path | None, tool_paths: list[str]) -> dict[str, Any]:
+def load_config(
+    config_path: Path | None,
+    tool_paths: list[str],
+    keywords_path: Path | None = None,
+) -> dict[str, Any]:
     cfg = dict(DEFAULT_CONFIG)
     if config_path and config_path.is_file():
         user_cfg = json.loads(config_path.read_text(encoding="utf-8"))
         cfg.update(user_cfg)
+    if keywords_path and keywords_path.is_file():
+        kw_data = json.loads(keywords_path.read_text(encoding="utf-8"))
+        existing = dict(cfg.get("page_keywords") or {})
+        incoming = kw_data.get("pages", kw_data) if isinstance(kw_data, dict) else {}
+        if isinstance(incoming, dict):
+            existing.update(incoming)
+        cfg["page_keywords"] = existing
     if tool_paths:
         cfg["tool_paths"] = list(cfg.get("tool_paths", [])) + tool_paths
     return cfg
@@ -1641,6 +1935,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--serve-timeout", type=float, default=30.0, help="Startup timeout in seconds for temporary local server")
     ap.add_argument("--sitemap", type=str, default=None, help="Optional explicit sitemap file path (--dist) or path/URL (--base-url)")
     ap.add_argument("--config", type=Path, default=None, help="Optional JSON config overriding thresholds/tool_paths")
+    ap.add_argument("--keywords", type=Path, default=None, help="Optional JSON map of path -> {primary, synonyms, protect_tdh} for Gate 6 TDH/intent checks")
     ap.add_argument("--tool-path", action="append", default=[], help="Explicit glob/path treated as interactive tool page")
     ap.add_argument("--timeout", type=float, default=15.0, help="Per-request HTTP timeout in seconds (--base-url mode)")
     ap.add_argument("--concurrency", type=int, default=6, help="Max concurrent HTTP fetches (--base-url mode, 1-16)")
@@ -1698,7 +1993,13 @@ def main(argv: list[str] | None = None) -> int:
         if candidate_base.is_file():
             baseline_path = candidate_base
 
-    cfg = load_config(config_path, args.tool_path)
+    keywords_path = args.keywords
+    if keywords_path is None and project_dir is not None:
+        candidate_kw = project_dir / "seo-gate-keywords.json"
+        if candidate_kw.is_file():
+            keywords_path = candidate_kw
+
+    cfg = load_config(config_path, args.tool_path, keywords_path=keywords_path)
 
     resolved_dist: Path | None = args.dist
     resolved_base_url: str | None = args.base_url
