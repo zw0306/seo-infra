@@ -149,12 +149,12 @@ jobs:
       TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
 ```
 
-### 上线前 5-Gate SEO 门禁（`seo_gate.py`）
+### 上线前 6-Gate SEO 门禁（`seo_gate.py`）
 
-同时支持 Astro 静态导出（`dist/`）、Next.js 静态导出（`out/`）、Next.js SSR（`.next/BUILD_ID`）及任意自定义预览服：
+同时支持 Astro 静态导出（`dist/`）、Next.js 静态导出（`out/`）、Next.js SSR（`.next/BUILD_ID`）及任意自定义预览服（含第 6 关 `onpage_tdh_intent`）：
 
 ```bash
-# 1. 自动识别项目类型（自动读取 .seo-gate.json 与 seo-gate-baseline.json）
+# 1. 自动识别项目类型（自动读取 .seo-gate.json、seo-gate-baseline.json 与 seo-gate-keywords.json）
 #    - Astro / Vite 静态站：直接扫描 dist/
 #    - Next.js SSR 站：自动在空闲端口启停 next start 并扫描 http://localhost:<port>
 python3 scripts/seo_gate.py --project /path/to/your-site
@@ -164,6 +164,22 @@ python3 scripts/seo_gate.py --project . --serve-cmd "npx astro preview --port {p
 
 # 3. 写入/刷新存量基线
 python3 scripts/seo_gate.py --project . --write-baseline seo-gate-baseline.json --warn-only
+```
+
+### Similarweb 关键词抓取与离线分析（`similarweb_keywords.py`）
+
+同时支持 **Similarweb 官网（`pro.similarweb.com`）** 和 **任意已登录镜像站**（通过本地真实 Chrome 的 `opencli browser` 复用登录态发同源请求，导出 JSON 中不记录私有镜像 IP）：
+
+```bash
+# 1. 绑定当前已打开的 Chrome 标签页（官网/镜像通用，零配置）
+python3 scripts/similarweb_keywords.py seed "krillion" --target bind --country 999 --limit 1000 --out-dir docs/keywords
+
+# 2. 直接指定官网或镜像环境变量
+python3 scripts/similarweb_keywords.py seed "krillion" --target official --country 840 --limit 1000
+SIMILARWEB_MIRROR_URL="http://<mirror-host>:<port>" python3 scripts/similarweb_keywords.py seed "krillion" --target mirror --country 999
+
+# 3. 离线分析已有词表并生成 Gate 6 关键词配置草稿
+python3 scripts/similarweb_keywords.py analyze docs/keywords/krillion-keywords-2026-11.json --max-kd 10 --emit-gate-draft seo-gate-keywords.draft.json
 ```
 
 ### 运行单元测试
